@@ -34,8 +34,8 @@ func logInfo(a ...interface{}) {
 }
 
 const (
-	ELFCLASS32      = 1
-	ELFCLASS64      = 2
+	ELFCLASS32 = 1
+	ELFCLASS64 = 2
 
 	PT_LOAD         = 1
 	PT_DYNAMIC      = 2
@@ -75,11 +75,9 @@ const (
 	DT_VERNEED      = 0x6ffffffe
 	DT_VERNEEDNUM   = 0x6fffffff
 	// AArch64 Relocation Types
-	R_AARCH64_NONE      = 0
-	R_AARCH64_RELATIVE  = 1027
 	R_AARCH64_GLOB_DAT  = 1025
 	R_AARCH64_JUMP_SLOT = 1026
-	R_AARCH64_ABS64     = 257
+	R_AARCH64_RELATIVE  = 1027
 
 	// Section Header Types (SHT)
 	SHT_NULL        = 0
@@ -457,42 +455,44 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		}
 	}
 
-// Add .plt and .got.plt sections
-if dynMap[DT_PLTGOT] != 0 && dynMap[DT_PLTRELSZ] != 0 {
-	pltRelocCount := dynMap[DT_PLTRELSZ] / 24
+	// Add .plt and .got sections
+	if dynMap[DT_PLTGOT] != 0 && dynMap[DT_PLTRELSZ] != 0 {
+		pltRelocCount := dynMap[DT_PLTRELSZ] / 24
 
-	// .plt section (before .got.plt, typically in executable segment)
-	// Size: 32 bytes (header) + 16 bytes per entry
-	pltSize := 32 + (pltRelocCount * 16)
-	if execPhdr != nil {
-		// Find space before .text for .plt
-		pltAddr := execPhdr.Vaddr
-		addSection(".plt", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, pltAddr, pltSize, 16, 16)
+		// .plt section (executable)
+		// Size: 32 bytes (header) + 16 bytes per entry
+		pltSize := 32 + (pltRelocCount * 16)
+		if execPhdr != nil {
+			// Heuristic: place .plt at the start of the executable segment
+			pltAddr := execPhdr.Vaddr
+			addSection(".plt", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, pltAddr, pltSize, 16, 16)
+		}
 	}
 
-	// Update .got to .got.plt
-	gotPltSize := (pltRelocCount + 3) * 8
-	addSection(".got.plt", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, dynMap[DT_PLTGOT], gotPltSize, 8, 8)
-}
-
-// Add symbol versioning sections
-if dynMap[DT_VERSYM] != 0 && symCount > 0 {
-	versymSize := symCount * 2 // 2 bytes per symbol
-	addSection(".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC, dynMap[DT_VERSYM], versymSize, 2, 2)
-}
-
-if dynMap[DT_VERNEED] != 0 {
-	// Size estimation: difficult without parsing, use heuristic
-	verneedSize := uint64(256) // Conservative estimate
-	addSection(".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC, dynMap[DT_VERNEED], verneedSize, 4, 0)
-}
-
-// Add .eh_frame_hdr section
-for i := range phdrs {
-	if phdrs[i].Type == PT_GNU_EH_FRAME && phdrs[i].Filesz > 0 {
-		addSection(".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, phdrs[i].Vaddr, phdrs[i].Filesz, 4, 0)
+	// Add symbol versioning sections
+	if dynMap[DT_VERSYM] != 0 && symCount > 0 {
+		versymSize := symCount * 2 // 2 bytes per symbol
+		addSection(".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC, dynMap[DT_VERSYM], versymSize, 2, 2)
 	}
-}
+	if dynMap[DT_VERNEED] != 0 && dynMap[DT_VERNEEDNUM] > 0 {
+		// Size is hard to calculate without parsing the verneed structures.
+		// A heuristic: 24 bytes per verneed entry + 16 bytes per vernaux entry.
+		// Assume average of 2 aux entries per need.
+		verneedSize := dynMap[DT_VERNEEDNUM] * (24 + 2*16)
+		addSection(".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC, dynMap[DT_VERNEED], verneedSize, 8, 0)
+	}
+
+	// Add .eh_frame section from PT_GNU_EH_FRAME
+	for i := range phdrs {
+		if phdrs[i].Type == PT_GNU_EH_FRAME && phdrs[i].Filesz > 0 {
+			// This PHDR covers both .eh_frame_hdr and .eh_frame.
+			// We need to find where .eh_frame_hdr ends and .eh_frame begins.
+			// The .eh_frame_hdr contains file-relative pointers into .eh_frame.
+			// For simplicity, we'll create a single section for now.
+			addSection(".eh_frame", SHT_PROGBITS, SHF_ALLOC, phdrs[i].Vaddr, phdrs[i].Filesz, 4, 0)
+			break // Assume only one
+		}
+	}
 
 	// Helper to get all sections currently defined that are file-backed
 	getFileBackedSections := func() []SectionInfo {
@@ -541,11 +541,21 @@ for i := range phdrs {
 	if rwPhdr != nil {
 		// Add .got (if not covered by dynamic pointers)
 		if dynMap[DT_PLTGOT] != 0 {
-			// .got starts at DT_PLTGOT.
-			// The size is estimated by the number of PLT relocations * 8 bytes/entry + 3 reserved entries.
+			// The .got.plt is part of the .got section, but specifically for PLT entries.
+			// The DT_PLTGOT pointer points to the start of the .got section.
+			// The first 3 entries are reserved. The rest are for PLT relocations.
 			pltRelocCount := dynMap[DT_PLTRELSZ] / 24 // 24 bytes per Elf64_Rela
-			gotSize := (pltRelocCount + 3) * 8
-			addSection(".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, dynMap[DT_PLTGOT], gotSize, 8, 8)
+			gotPltSize := (pltRelocCount + 3) * 8
+			addSection(".got.plt", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, dynMap[DT_PLTGOT]+24, gotPltSize, 8, 8)
+
+			// Also add the .got section which contains .got.plt
+			// We estimate its size from the start of DT_PLTGOT to the end of the writable segment's file-backed portion.
+			if dynMap[DT_PLTGOT] >= rwPhdr.Vaddr {
+				gotSize := (rwPhdr.Vaddr + rwPhdr.Filesz) - dynMap[DT_PLTGOT]
+				if gotSize > 0 {
+					addSection(".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, dynMap[DT_PLTGOT], gotSize, 8, 8)
+				}
+			}
 		}
 
 		// Collect all known file-backed sections that fall within the rwPhdr's range
@@ -828,7 +838,7 @@ func fixRelocations(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error
 		return fmt.Errorf("failed to read dynamic section for relocation info: %w", err)
 	}
 
-	var relaOffset, relaSize, jmprelOffset, jmprelSize uint64
+	var relaOffset, relaSize, jmprelOffset, jmprelSize uint64;
 	for _, entry := range dynamicEntries {
 		switch entry.Tag {
 		case DT_RELA:
@@ -842,7 +852,7 @@ func fixRelocations(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error
 		}
 	}
 	logDebug(cText("   -> DT_RELA table at "), fAddress(relaOffset), cText(", size="), cValue(relaSize))
-	logDebug(cText("   -> DT_JMPREL table at "), fAddress(jmprelOffset), cText(" size="), cValue(jmprelSize))
+	logDebug(cText("   -> DT_JMPREL table at "), fAddress(jmprelOffset), cText(", size="), cValue(jmprelSize))
 
 	// Helper function to process a single relocation table
 	processTable := func(offset, size uint64) error {
@@ -869,8 +879,8 @@ func fixRelocations(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error
 			rel := &relocations[i]
 			relType := rel.Info & 0xFFFFFFFF // Lower 32 bits is the type
 
-			// Only fix R_AARCH64_RELATIVE relocations
-			if relType == R_AARCH64_RELATIVE {
+			// Only fix relocation types that point to absolute addresses in memory.
+			if relType == R_AARCH64_RELATIVE || relType == R_AARCH64_GLOB_DAT || relType == R_AARCH64_JUMP_SLOT {
 				// The pointer at rel.Offset is a runtime address.
 				// We need to read the pointer, subtract the baseAddr, and write it back.
 
@@ -889,7 +899,7 @@ func fixRelocations(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error
 					// We will assume it is a runtime address and fix it.
 				}
 				fixedPointerVal := pointerVal - baseAddr
-				logDebug(cText("      - Fixed R_AARCH64_RELATIVE at "), fAddress(rel.Offset), cText(" to "), fValue(fixedPointerVal))
+				logDebug(cText("      - Fixed relocation at "), fAddress(rel.Offset), cText(" to "), fAddress(fixedPointerVal))
 
 				// 3. Write the fixed pointer back
 				if _, err := file.Seek(int64(rel.Offset), io.SeekStart); err != nil {
@@ -956,7 +966,7 @@ func fixDynamicSection(file *os.File, phdrs []ProgramHeader, baseAddr uint64) er
 
 		// Only fix entries that are pointers (DT_PTR tags)
 		switch entry.Tag {
-		case DT_PLTGOT, DT_HASH, DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_JMPREL, DT_INIT_ARRAY, DT_FINI_ARRAY:
+		case DT_PLTGOT, DT_HASH, DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_JMPREL, DT_INIT_ARRAY, DT_FINI_ARRAY, DT_VERNEED, DT_VERSYM:
 			// Check if the pointer is a runtime address (i.e., greater than the base address)
 			if entry.Val >= baseAddr {
 				logDebug(cText("      - Fixing dynamic entry "), fValue(entry.Tag), cText(" to "), fAddress(entry.Val-baseAddr))
