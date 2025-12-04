@@ -56,7 +56,11 @@ const (
 	DT_RELAENT      DT_Tag = 9
 	DT_STRSZ        DT_Tag = 10
 	DT_SYMENT       DT_Tag = 11
+	DT_INIT         DT_Tag = 12
+	DT_FINIT        DT_Tag = 13
 	DT_SONAME       DT_Tag = 14
+	DT_RPATH        DT_Tag = 15
+	DT_SYMBOLIC     DT_Tag = 16
 	DT_REL          DT_Tag = 17
 	DT_RELSZ        DT_Tag = 18
 	DT_RELENT       DT_Tag = 19
@@ -132,37 +136,38 @@ func (t DT_Tag) Text() string {
 		return "DT_RELACOUNT"
 	case DT_RELCOUNT:
 		return "DT_RELCOUNT"
+	case DT_SYMBOLIC:
+		return "DT_SYMBOLIC"
 	default:
-		return fmt.Sprintf("DT_UNKNOWN(%d)", t)
+		return fmt.Sprintf("DT_UNKNOWN(0x%x)", t)
 	}
 }
 
 type RelocationType uint32
 
 const (
-    R_AARCH64_NONE      RelocationType = 0   // No relocation
-    R_AARCH64_ABS64     RelocationType = 257 // Direct 64-bit reference
-    R_AARCH64_ABS32     RelocationType = 258 // Direct 32-bit reference
-    R_AARCH64_ABS16     RelocationType = 259 // Direct 16-bit reference
-    R_AARCH64_PREL64    RelocationType = 260 // PC-relative 64-bit reference
-    R_AARCH64_PREL32    RelocationType = 261 // PC-relative 32-bit reference
-    R_AARCH64_PREL16    RelocationType = 262 // PC-relative 16-bit reference
+	R_AARCH64_NONE      RelocationType = 0x0   // 0
+	R_AARCH64_ABS64     RelocationType = 0x101 // 257 (Direct 64-bit reference)
+	R_AARCH64_ABS32     RelocationType = 0x102 // 258
+	R_AARCH64_ABS16     RelocationType = 0x103 // 259
+	R_AARCH64_PREL64    RelocationType = 0x104 // 260 (PC-relative 64-bit reference)
+	R_AARCH64_PREL32    RelocationType = 0x105 // 261
+	R_AARCH64_PREL16    RelocationType = 0x106 // 262
 
-    // Used for dynamic linker fixups (as seen in your code)
-    R_AARCH64_RELATIVE  RelocationType = 1027 // (3 + 1024) Adjust by (B + A)
-    R_AARCH64_COPY      RelocationType = 264
-    R_AARCH64_GLOB_DAT  RelocationType = 1025 // (1 + 1024) Set GOT entry to address of symbol
-    R_AARCH64_JUMP_SLOT RelocationType = 1026 // (2 + 1024) Set PLT entry to address of symbol
-    R_AARCH64_TLS_DTPMOD RelocationType = 1028 // Module ID
-    R_AARCH64_TLS_DTPREL RelocationType = 1029 // Offset in TLS block
+	// Used for dynamic linker fixups
+	R_AARCH64_COPY      RelocationType = 0x108 // 264
+	R_AARCH64_GLOB_DAT  RelocationType = 0x401 // 1025 (1 + 1024)
+	R_AARCH64_JUMP_SLOT RelocationType = 0x402 // 1026 (2 + 1024)
+	R_AARCH64_RELATIVE  RelocationType = 0x403 // 1027 (3 + 1024)
+	R_AARCH64_TLS_DTPMOD RelocationType = 0x404 // 1028
+	R_AARCH64_TLS_DTPREL RelocationType = 0x405 // 1029
 
-    // Other commonly used code-related relocations
-    R_AARCH64_ADR_PREL21 RelocationType = 275
-    R_AARCH64_ADD_ABS_LO12_NC RelocationType = 276
-    R_AARCH64_CALL26    RelocationType = 283  // Function call (26-bit immediate)
-    R_AARCH64_JUMP26    RelocationType = 284  // Function jump (26-bit immediate)
+	// Other commonly used code-related relocations
+	R_AARCH64_ADR_PREL21 RelocationType = 0x113 // 275
+	R_AARCH64_ADD_ABS_LO12_NC RelocationType = 0x114 // 276
+	R_AARCH64_CALL26    RelocationType = 0x11B // 283
+	R_AARCH64_JUMP26    RelocationType = 0x11C // 284
 )
-
 func (r RelocationType) Text() string {
     switch r {
     case R_AARCH64_NONE:
@@ -213,6 +218,20 @@ const (
 	STB_WEAK   SymbolBinding = 2
 )
 
+func (b SymbolBinding) Text() string {
+	switch(b) {
+    case STB_LOCAL:
+		return "STB_LOCAL"
+    case STB_GLOBAL:
+        return "STB_GLOBAL"
+    case STB_WEAK:
+        return "STB_WEAK"
+    default:
+        // Default case for unknown symbol binding
+        return fmt.Sprintf("STB_UNKNOWN_BINDING(%d)", b)
+    }
+}
+
 type SymbolType uint8
 
 const (
@@ -227,31 +246,31 @@ const (
 
 
 // Helper functions for symbol info
-func (s SymbolEntry) stBind() SymbolBinding {
+func (s Elf64_Sym) stBind() SymbolBinding {
 	return SymbolBinding(s.St_Info >> 4)
 }
 
-func (s SymbolEntry) stType() SymbolType {
+func (s Elf64_Sym) stType() SymbolType {
 	return SymbolType(s.St_Info & 0xf)
 }
 
-func (s SymbolEntry) stInfo() uint8 {
+func (s Elf64_Sym) stInfo() uint8 {
 	return (uint8(s.stBind()) << 4) | (uint8(s.stType()) & 0xf)
 }
 
-func (r RelEntry) Type() RelocationType {
+func (r Elf64_Rel) Type() RelocationType {
 	return RelocationType(r.Info & 0xffffffff)
 }
 
-func (r RelEntry) Sym() uint32 {
+func (r Elf64_Rel) Sym() uint32 {
 	return uint32(r.Info >> 32)
 }
 
-func (r RelaEntry) Type() RelocationType {
+func (r Elf64_Rela) Type() RelocationType {
 	return RelocationType(r.Info & 0xffffffff)
 }
 
-func (r RelaEntry) Sym() uint32 {
+func (r Elf64_Rela) Sym() uint32 {
 	return uint32(r.Info >> 32)
 }
 

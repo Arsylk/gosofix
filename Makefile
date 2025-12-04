@@ -17,12 +17,7 @@ $(TARGET): $(GOSOURCES)
 
 
 test: all
-	@echo Running on test elf dumps...
-	@rm -rf test/
-	@cp -r tests/ test/
-	for file in test/*.so; do \
-		$(TARGET) -d $$file $$(basename $$file | cut -d'_' -f 2 | sed 's/\.so//'); \
-	done
+	$(TARGET) tests/libdexprotector.so_dump_0x6ddc6d8000.so 0x6ddc6d8000
 
 clean:
 	@rm -rf $(DIST_DIR)
