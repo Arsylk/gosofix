@@ -19,17 +19,19 @@ type ElfRebuilder struct {
 	currentOffset uint64
 
 	// Section indices
-	nullSectionIdx     int
-	textSectionIdx     int
-	dynstrSectionIdx   int
-	dynsymSectionIdx   int
-	hashSectionIdx     int
-	gnuHashSectionIdx  int
-	dynamicSectionIdx  int
-	relSectionIdx      int
-	relaSectionIdx     int
-	pltRelSectionIdx   int
-	shstrtabSectionIdx int
+	nullSectionIdx      int
+	dynstrSectionIdx    int
+	dynsymSectionIdx    int
+	hashSectionIdx      int
+	gnuHashSectionIdx   int
+	dynamicSectionIdx   int
+	relSectionIdx       int
+	relaSectionIdx      int
+	pltRelSectionIdx    int
+	gotSectionIdx       int
+	initArraySectionIdx int
+	finiArraySectionIdx int
+	shstrtabSectionIdx  int
 
 	// Section header string table
 	shstrtab    []byte
@@ -107,6 +109,34 @@ func (rb *ElfRebuilder) addSection(name string, shType uint32, flags uint64, add
 	return idx
 }
 
+// addSectionHeader adds a section header for data already in PT_LOAD segments
+// This does NOT store any data - the section just points to existing segment data
+func (rb *ElfRebuilder) addSectionHeader(name string, shType uint32, flags uint64, addr uint64, size uint64, link uint32, info uint32, addralign uint64, entsize uint64) int {
+	nameOffset := rb.addShstrtabString(name)
+
+	// Convert virtual address to file offset
+	fileOffset := rb.vaddrToOffset(addr)
+
+	section := Elf64_Shdr{
+		Name:      nameOffset,
+		Type:      shType,
+		Flags:     flags,
+		Addr:      addr,
+		Offset:    fileOffset,
+		Size:      size,
+		Link:      link,
+		Info:      info,
+		Addralign: addralign,
+		Entsize:   entsize,
+	}
+
+	idx := len(rb.sections)
+	rb.sections = append(rb.sections, section)
+	// No data stored - section points to data in PT_LOAD segment
+
+	return idx
+}
+
 // buildSections creates all necessary sections from the ElfReader data
 func (rb *ElfRebuilder) buildSections() error {
 	logInfo(cText("* Building ELF sections..."))
@@ -153,45 +183,31 @@ func (rb *ElfRebuilder) buildSections() error {
 	}
 
 	// 4. .hash section (if present)
-	if rb.reader.dynMap[DT_HASH] != 0 {
-		hashSize, err := calculateHashSize(rb.reader.File, rb.reader.dynMap[DT_HASH])
-		if err == nil && hashSize > 0 {
-			hashData := make([]byte, hashSize)
-			rb.reader.File.Seek(int64(rb.reader.dynMap[DT_HASH]), io.SeekStart)
-			rb.reader.File.Read(hashData)
-
-			rb.hashSectionIdx = rb.addSection(
-				".hash",
-				SHT_HASH,
-				SHF_ALLOC,
-				rb.reader.dynMap[DT_HASH],
-				hashData,
-				uint32(rb.dynsymSectionIdx),
-				0, 8, 4,
-			)
-			logInfo(cText("   + .hash: "), fValue(hashSize), cText(" bytes"))
-		}
+	if rb.reader.hashOffset != 0 && rb.reader.hashSize > 0 {
+		rb.hashSectionIdx = rb.addSectionHeader(
+			".hash",
+			SHT_HASH,
+			SHF_ALLOC,
+			rb.reader.hashOffset,
+			rb.reader.hashSize,
+			uint32(rb.dynsymSectionIdx),
+			0, 8, 4,
+		)
+		logInfo(cText("   + .hash: "), fValue(rb.reader.hashSize), cText(" bytes"))
 	}
 
 	// 5. .gnu.hash section (if present)
-	if rb.reader.dynMap[DT_GNU_HASH] != 0 {
-		gnuHashSize, err := calculateGnuHashSize(rb.reader.File, rb.reader.dynMap[DT_GNU_HASH], rb.reader.symCount)
-		if err == nil && gnuHashSize > 0 {
-			gnuHashData := make([]byte, gnuHashSize)
-			rb.reader.File.Seek(int64(rb.reader.dynMap[DT_GNU_HASH]), io.SeekStart)
-			rb.reader.File.Read(gnuHashData)
-
-			rb.gnuHashSectionIdx = rb.addSection(
-				".gnu.hash",
-				SHT_GNU_HASH,
-				SHF_ALLOC,
-				rb.reader.dynMap[DT_GNU_HASH],
-				gnuHashData,
-				uint32(rb.dynsymSectionIdx),
-				0, 8, 0,
-			)
-			logInfo(cText("   + .gnu.hash: "), fValue(gnuHashSize), cText(" bytes"))
-		}
+	if rb.reader.gnuHashOffset != 0 && rb.reader.gnuHashSize > 0 {
+		rb.gnuHashSectionIdx = rb.addSectionHeader(
+			".gnu.hash",
+			SHT_GNU_HASH,
+			SHF_ALLOC,
+			rb.reader.gnuHashOffset,
+			rb.reader.gnuHashSize,
+			uint32(rb.dynsymSectionIdx),
+			0, 8, 0,
+		)
+		logInfo(cText("   + .gnu.hash: "), fValue(rb.reader.gnuHashSize), cText(" bytes"))
 	}
 
 	// 6. .rela.dyn section (RELA relocations)
@@ -256,30 +272,59 @@ func (rb *ElfRebuilder) buildSections() error {
 	}
 
 	// 9. .dynamic section
-	if len(rb.reader.Dyns) > 0 {
-		dynData := makeBytes(rb.reader.Dyns)
-
-		var dynamicVaddr uint64
-		for _, phdr := range rb.reader.Phdrs {
-			if phdr.Type == PT_DYNAMIC {
-				dynamicVaddr = phdr.Vaddr
-				break
-			}
-		}
-
-		rb.dynamicSectionIdx = rb.addSection(
+	if rb.reader.dynamicOffset != 0 && rb.reader.dynamicSize > 0 {
+		rb.dynamicSectionIdx = rb.addSectionHeader(
 			".dynamic",
 			SHT_DYNAMIC,
 			SHF_ALLOC|SHF_WRITE,
-			dynamicVaddr,
-			dynData,
+			rb.reader.dynamicOffset,
+			rb.reader.dynamicSize,
 			uint32(rb.dynstrSectionIdx),
 			0, 8, 16,
 		)
-		logInfo(cText("   + .dynamic: "), fValue(len(rb.reader.Dyns)), cText(" entries"))
+		logInfo(cText("   + .dynamic: "), fValue(rb.reader.dynamicSize/16), cText(" entries"))
 	}
 
-	// 10. .shstrtab section (section header string table) - must be last
+	// 10. .got section (Global Offset Table)
+	if rb.reader.gotOffset != 0 && rb.reader.gotSize > 0 {
+		rb.gotSectionIdx = rb.addSectionHeader(
+			".got",
+			SHT_PROGBITS,
+			SHF_ALLOC|SHF_WRITE,
+			rb.reader.gotOffset,
+			rb.reader.gotSize,
+			0, 0, 8, 8,
+		)
+		logInfo(cText("   + .got: "), fValue(rb.reader.gotSize), cText(" bytes"))
+	}
+
+	// 11. .init_array section
+	if rb.reader.initArrayOffset != 0 && rb.reader.initArraySize > 0 {
+		rb.initArraySectionIdx = rb.addSectionHeader(
+			".init_array",
+			SHT_INIT_ARRAY,
+			SHF_ALLOC|SHF_WRITE,
+			rb.reader.initArrayOffset,
+			rb.reader.initArraySize,
+			0, 0, 8, 8,
+		)
+		logInfo(cText("   + .init_array: "), fValue(rb.reader.initArraySize), cText(" bytes"))
+	}
+
+	// 12. .fini_array section
+	if rb.reader.finiArrayOffset != 0 && rb.reader.finiArraySize > 0 {
+		rb.finiArraySectionIdx = rb.addSectionHeader(
+			".fini_array",
+			SHT_FINI_ARRAY,
+			SHF_ALLOC|SHF_WRITE,
+			rb.reader.finiArrayOffset,
+			rb.reader.finiArraySize,
+			0, 0, 8, 8,
+		)
+		logInfo(cText("   + .fini_array: "), fValue(rb.reader.finiArraySize), cText(" bytes"))
+	}
+
+	// 13. .shstrtab section (section header string table) - must be last
 	// We must add the name to the string table BEFORE calling addSection,
 	// because addSection takes the data slice by value. If we don't do this,
 	// the data slice passed to addSection won't contain the name of the section itself,
@@ -438,21 +483,23 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 	logInfo(cText("   + Wrote program headers"))
 
 	// Copy segment data from original file (the actual program code/data)
-	// This is critical - without this, we only have metadata but no actual program content!
+	// For memory dumps: data is at VADDR positions in the source file
+	// We read from phdr.Vaddr (source) and write to phdr.Offset (output ELF)
 	for i, phdr := range rb.reader.Phdrs {
 		if phdr.Type == PT_LOAD && phdr.Filesz > 0 {
-			// Calculate what portion of this segment to copy
-			// We need to skip the ELF header and program headers if this segment starts at 0
-			copyOffset := phdr.Offset
+			// For memory dumps: read from Vaddr, write to Offset
+			srcOffset := phdr.Vaddr  // Where data is in the memory dump
+			dstOffset := phdr.Offset // Where it should be in the output ELF
 			copySize := phdr.Filesz
 
-			// Skip ELF header and program headers (they're already written correctly)
+			// Skip ELF header and program headers if this segment starts at 0
 			headerAndPhdrSize := uint64(rb.reader.ElfHeader.Ehsize) +
 				uint64(rb.reader.ElfHeader.Phnum)*uint64(rb.reader.ElfHeader.Phentsize)
 
 			if phdr.Offset == 0 {
 				// This segment starts at the beginning, skip the headers
-				copyOffset = headerAndPhdrSize
+				srcOffset += headerAndPhdrSize
+				dstOffset = headerAndPhdrSize
 				copySize = phdr.Filesz - headerAndPhdrSize
 				logDebug(cText("   + Skipping ELF+program headers ("), fValue(headerAndPhdrSize),
 					cText(" bytes) for segment "), fValue(i))
@@ -463,20 +510,21 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 			}
 
 			logDebug(cText("   + Copying PT_LOAD segment "), fValue(i),
-				cText(" from offset "), fAddress(copyOffset),
+				cText(" from vaddr "), fAddress(srcOffset),
+				cText(" to offset "), fAddress(dstOffset),
 				cText(" size "), fValue(copySize))
 
-			// Read from original file
+			// Read from original file (memory dump - data at vaddr positions)
 			segmentData := make([]byte, copySize)
-			if _, err := rb.reader.File.Seek(int64(copyOffset), io.SeekStart); err != nil {
+			if _, err := rb.reader.File.Seek(int64(srcOffset), io.SeekStart); err != nil {
 				return fmt.Errorf("failed to seek to segment %d in source: %w", i, err)
 			}
 			if _, err := io.ReadFull(rb.reader.File, segmentData); err != nil {
 				return fmt.Errorf("failed to read segment %d data: %w", i, err)
 			}
 
-			// Write to output file at same offset
-			if _, err := file.Seek(int64(copyOffset), io.SeekStart); err != nil {
+			// Write to output file at proper ELF offset
+			if _, err := file.Seek(int64(dstOffset), io.SeekStart); err != nil {
 				return fmt.Errorf("failed to seek to segment %d in output: %w", i, err)
 			}
 			if _, err := file.Write(segmentData); err != nil {

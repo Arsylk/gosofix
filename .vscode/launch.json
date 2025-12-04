@@ -20,8 +20,14 @@
             "name": "Launch Package",
             "type": "go",
             "request": "launch",
-            "mode": "auto",
-            "program": "${fileDirname}"
+            "mode": "debug",
+            "program": "${workspaceFolder}/cmd/main.go",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-d",
+                "tests/libdexprotector.so_dump_0x6ddc6d8000.so",
+                "0x6ddc6d8000"
+            ]
         }
     ]
 }

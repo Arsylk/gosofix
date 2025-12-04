@@ -33,7 +33,7 @@ func main() {
 			outputPath = filePath + "_fix.so"
 		} else {
 
-			outputPath = string([]rune(filePath)[0:len(filePath)-1-len(ext)]) + "_fix." + ext
+			outputPath = string([]rune(filePath)[0:len(filePath)-len(ext)]) + "_fix" + ext
 		}
 	}
 

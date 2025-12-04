@@ -59,6 +59,27 @@ type ElfReader struct {
 	phdrPtLoadPageStart uint64
 	symCount            uint64
 
+	// .got, .init_array, .fini_array
+	gotOffset       uint64
+	gotSize         uint64
+	initArrayOffset uint64
+	initArraySize   uint64
+	finiArrayOffset uint64
+	finiArraySize   uint64
+
+	// .hash and .gnu.hash
+	hashOffset    uint64
+	hashSize      uint64
+	gnuHashOffset uint64
+	gnuHashSize   uint64
+
+	// .dynamic section
+	dynamicOffset uint64
+	dynamicSize   uint64
+
+	// .strtab size
+	strtabSize uint64
+
 	newStrtabMap map[string]uint32
 	newStrtab    []byte
 	newSymbols   []Elf64_Sym
@@ -303,10 +324,11 @@ func (r *ElfReader) ReadDyns() error {
 		}
 	}
 
-	logInfo(cText("* Reading DYN at offset "), fAddress(dynamicPhdr.Offset))
 	if dynamicPhdr == nil {
 		return nil
 	}
+
+	logInfo(cText("* Reading DYN at offset "), fAddress(dynamicPhdr.Offset))
 
 	entryCount := dynamicPhdr.Memsz / 16
 
@@ -315,15 +337,18 @@ func (r *ElfReader) ReadDyns() error {
 	}
 	logDebug(cText("   -> Dynamic section found p_vaddr="), fAddress(dynamicPhdr.Vaddr), cText(", p_offset="), fAddress(dynamicPhdr.Offset), cText(", entries="), fValue(entryCount))
 
+	// Store dynamic section info
+	r.dynamicOffset = dynamicPhdr.Vaddr
+	r.dynamicSize = dynamicPhdr.Memsz
+
 	// Read the dynamic section content
 	r.Dyns = make([]Elf64_Dyn, entryCount)
 
 	// For memory dumps, use p_vaddr as the file offset since the dump is sequential by VA
 	// For regular ELF files, p_offset would be correct, but memory dumps don't follow that
-	dynamicOffset := dynamicPhdr.Vaddr
-	logDebug(cText("   -> Using vaddr as file offset: "), fAddress(dynamicOffset))
+	logDebug(cText("   -> Using vaddr as file offset: "), fAddress(r.dynamicOffset))
 
-	if _, err := r.File.Seek(int64(dynamicOffset), io.SeekStart); err != nil {
+	if _, err := r.File.Seek(int64(r.dynamicOffset), io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to dynamic section: %w", err)
 	}
 
@@ -357,6 +382,22 @@ func (r *ElfReader) ReadDyns() error {
 			}
 		case DT_PLTRELSZ:
 			r.jmprelSize = entry.Val
+		case DT_PLTGOT:
+			r.gotOffset = entry.Val
+		case DT_INIT_ARRAY:
+			r.initArrayOffset = entry.Val
+		case DT_INIT_ARRAYSZ:
+			r.initArraySize = entry.Val
+		case DT_FINI_ARRAY:
+			r.finiArrayOffset = entry.Val
+		case DT_FINI_ARRAYSZ:
+			r.finiArraySize = entry.Val
+		case DT_HASH:
+			r.hashOffset = entry.Val
+		case DT_GNU_HASH:
+			r.gnuHashOffset = entry.Val
+		case DT_STRSZ:
+			r.strtabSize = entry.Val
 		}
 		logInfo(cText("    - dynamic "), cLabel(entry.Tag.Text()), cText(" "), baseLog)
 		r.dynMap[entry.Tag] = entry.Val
@@ -426,6 +467,32 @@ func (r *ElfReader) ReadRelocs() error {
 				return fmt.Errorf("failed to read jmprel table: %w", err)
 			}
 		}
+	}
+
+	// Calculate .hash size from its header
+	if r.hashOffset != 0 {
+		size, err := calculateHashSize(r.File, r.hashOffset)
+		if err == nil {
+			r.hashSize = size
+		}
+	}
+
+	// Calculate .gnu.hash size from its header and symCount
+	if r.gnuHashOffset != 0 {
+		size, err := calculateGnuHashSize(r.File, r.gnuHashOffset, r.symCount)
+		if err == nil {
+			r.gnuHashSize = size
+		}
+	}
+
+	// Calculate .got size: 3 reserved entries + number of PLT entries
+	// Each entry is 8 bytes on 64-bit
+	if r.gotOffset != 0 {
+		pltEntries := uint64(0)
+		if r.jmprelEntry > 0 && r.jmprelSize > 0 {
+			pltEntries = r.jmprelSize / r.jmprelEntry
+		}
+		r.gotSize = (3 + pltEntries) * 8
 	}
 
 	return nil
@@ -587,8 +654,13 @@ func (r *ElfReader) BuildStrtab() error {
 	globalSymbols := []Elf64_Sym{}
 
 	for i, sym := range r.Symbols {
-		if sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0 && i != 0 {
-			continue // Skip null entries (but not the first one)
+		// Skip the first symbol (null symbol) since we already added it
+		if i == 0 {
+			continue
+		}
+		// Skip empty/null entries
+		if sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0 {
+			continue
 		}
 
 		// Read original symbol name
@@ -602,7 +674,9 @@ func (r *ElfReader) BuildStrtab() error {
 		sym.St_Name = addString(symName)
 
 		// Separate local and global symbols (ELF requires locals first)
-		if sym.stBind() == STB_LOCAL {
+		bind := sym.stBind()
+		logDebug(cText("        -> Binding: "), cValue(bind.Text()), cText(" ("), fValue(bind), cText(")"))
+		if bind == STB_LOCAL {
 			localSymbols = append(localSymbols, sym)
 		} else {
 			globalSymbols = append(globalSymbols, sym)
