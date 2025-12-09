@@ -2,8 +2,87 @@ package sofixer
 
 import "fmt"
 
+// Elf64_Ehdr represents the main ELF header structure (e_ident + rest of header).
+type Elf64_Ehdr struct {
+	Magic      [4]byte // 0x00-0x03: Magic number
+	Class      uint8   // 0x04: 32-bit or 64-bit
+	Data       uint8   // 0x05: Little or big endian
+	Version    uint8   // 0x06: ELF version
+	OSABI      uint8   // 0x07: OS/ABI identification
+	ABIVersion uint8   // 0x08: ABI version
+	Padding    [7]byte // 0x09-0x0F: Unused
+	Type       uint16  // 0x10-0x11: object file type
+	Machine    uint16  // 0x12-0x13: architecture
+	Version2   uint32  // 0x14-0x17: ELF version (again)
+	Entry      uint64  // 0x18-0x1F: entry point virtual address
+	PhdrOffset uint64  // 0x20-0x27: program header table file offset
+	ShdrOffset uint64  // 0x28-0x2F: section header table file offset
+	Flags      uint32  // 0x30-0x33: processor specific flags
+	Ehsize     uint16  // 0x34-0x35: ELF header size
+	Phentsize  uint16  // 0x36-0x37: size of an entry in the program header table
+	Phnum      uint16  // 0x38-0x39: number of entries in the program header table
+	Shentsize  uint16  // 0x3A-0x3B: size of an entry in the section header table
+	Shnum      uint16  // 0x3C-0x3D: number of entries in the section header table
+	Shstrndx   uint16  // 0x3E-0x3F: section header string table index
+}
+
+// Elf64_Phdr represents a 64-bit program header entry (Elf64_Phdr).
+type Elf64_Phdr struct {
+	Type   PT_Type // Segment type
+	Flags  uint32  // Segment flags
+	Offset uint64  // Segment file offset
+	Vaddr  uint64  // Segment virtual address
+	Paddr  uint64  // Segment physical address
+	Filesz uint64  // Segment file size
+	Memsz  uint64  // Segment memory size
+	Align  uint64  // Segment alignment
+}
+
+// Elf64_Shdr represents a 64-bit section header entry (Elf64_Shdr).
+type Elf64_Shdr struct {
+	Name      uint32   // Section name (index into string table)
+	Type      SHT_Type // Section type
+	Flags     uint64   // Section flags
+	Addr      uint64   // Address in memory
+	Offset    uint64   // Offset in file
+	Size      uint64   // Size of section in file
+	Link      uint32   // Link to another section
+	Info      uint32   // Additional section information
+	Addralign uint64   // Section alignment
+	Entsize   uint64   // Size of entries in section
+}
+
+// Elf64_Dyn represents a 64-bit dynamic section entry (Elf64_Dyn).
+type Elf64_Dyn struct {
+	Tag DT_Tag // Dynamic entry type
+	Val uint64 // Value or pointer
+}
+
+// Elf64_Rela represents a 64-bit relocation entry with explicit addend (Elf64_Rela).
+type Elf64_Rela struct {
+	Offset uint64 // Address of reference
+	Info   uint64 // Symbol index and type of relocation
+	Addend int64  // Constant addend
+}
+
+// Elf64_Rel represents a 64-bit relocation entry without addend (Elf64_Rel).
+type Elf64_Rel struct {
+	Offset uint64 // Address of reference
+	Info   uint64 // Symbol index and type of relocation
+}
+
+// Elf64_Sym represents a 64-bit ELF symbol table entry
+type Elf64_Sym struct {
+	St_Name  uint32 // Symbol name (index into string table)
+	St_Info  uint8  // Symbol type and binding attributes
+	St_Other uint8  // Visibility and other attributes
+	St_Shndx uint16 // Section index where the symbol is defined
+	St_Value uint64 // Value of the symbol (address or offset)
+	St_Size  uint64 // Size of the symbol
+}
 
 type PT_Type uint32
+
 const (
 	PT_LOAD         PT_Type = 1
 	PT_DYNAMIC      PT_Type = 2
@@ -16,33 +95,29 @@ const (
 	PT_GNU_RELRO    PT_Type = 0x6474e552
 )
 
-func (p PT_Type) Text() string {
-    switch p {
-    case PT_LOAD:
-        return "PT_LOAD"
-    case PT_DYNAMIC:
-        return "PT_DYNAMIC"
-    case PT_INTERP:
-        return "PT_INTERP"
-    case PT_NOTE:
-        return "PT_NOTE"
-    case PT_PHDR:
-        return "PT_PHDR"
-    case PT_TLS:
-        return "PT_TLS"
-    case PT_GNU_EH_FRAME:
-        return "PT_GNU_EH_FRAME"
-    case PT_GNU_STACK:
-        return "PT_GNU_STACK"
-    case PT_GNU_RELRO:
-        return "PT_GNU_RELRO"
-    default:
-        // Handle unknown or vendor-specific types
-        return fmt.Sprintf("UNKNOWN_PT_TYPE(0x%x)", p)
-    }
-}
+type SHT_Type uint32
+
+const (
+	SHT_NULL        SHT_Type = 0
+	SHT_PROGBITS    SHT_Type = 1
+	SHT_SYMTAB      SHT_Type = 2
+	SHT_STRTAB      SHT_Type = 3
+	SHT_RELA        SHT_Type = 4
+	SHT_HASH        SHT_Type = 5
+	SHT_DYNAMIC     SHT_Type = 6
+	SHT_NOTE        SHT_Type = 7
+	SHT_NOBITS      SHT_Type = 8
+	SHT_REL         SHT_Type = 9
+	SHT_DYNSYM      SHT_Type = 11
+	SHT_INIT_ARRAY  SHT_Type = 14
+	SHT_FINI_ARRAY  SHT_Type = 15
+	SHT_GNU_HASH    SHT_Type = 0x6ffffff6
+	SHT_GNU_VERNEED SHT_Type = 0x6ffffffe
+	SHT_GNU_VERSYM  SHT_Type = 0x6fffffff
+)
 
 type DT_Tag uint64
+
 const (
 	DT_NULL         DT_Tag = 0
 	DT_NEEDED       DT_Tag = 1
@@ -79,6 +154,71 @@ const (
 	DT_VERNEED      DT_Tag = 0x6ffffffe
 	DT_VERNEEDNUM   DT_Tag = 0x6fffffff
 )
+
+func (p PT_Type) Text() string {
+	switch p {
+	case PT_LOAD:
+		return "PT_LOAD"
+	case PT_DYNAMIC:
+		return "PT_DYNAMIC"
+	case PT_INTERP:
+		return "PT_INTERP"
+	case PT_NOTE:
+		return "PT_NOTE"
+	case PT_PHDR:
+		return "PT_PHDR"
+	case PT_TLS:
+		return "PT_TLS"
+	case PT_GNU_EH_FRAME:
+		return "PT_GNU_EH_FRAME"
+	case PT_GNU_STACK:
+		return "PT_GNU_STACK"
+	case PT_GNU_RELRO:
+		return "PT_GNU_RELRO"
+	default:
+		// Handle unknown or vendor-specific types
+		return fmt.Sprintf("UNKNOWN_PT_TYPE(0x%x)", p)
+	}
+}
+
+func (t SHT_Type) String() string {
+	switch t {
+	case SHT_NULL:
+		return "SHT_NULL"
+	case SHT_PROGBITS:
+		return "SHT_PROGBITS"
+	case SHT_SYMTAB:
+		return "SHT_SYMTAB"
+	case SHT_STRTAB:
+		return "SHT_STRTAB"
+	case SHT_RELA:
+		return "SHT_RELA"
+	case SHT_HASH:
+		return "SHT_HASH"
+	case SHT_DYNAMIC:
+		return "SHT_DYNAMIC"
+	case SHT_NOTE:
+		return "SHT_NOTE"
+	case SHT_NOBITS:
+		return "SHT_NOBITS"
+	case SHT_REL:
+		return "SHT_REL"
+	case SHT_DYNSYM:
+		return "SHT_DYNSYM"
+	case SHT_INIT_ARRAY:
+		return "SHT_INIT_ARRAY"
+	case SHT_FINI_ARRAY:
+		return "SHT_FINI_ARRAY"
+	case SHT_GNU_HASH:
+		return "SHT_GNU_HASH"
+	case SHT_GNU_VERNEED:
+		return "SHT_GNU_VERNEED"
+	case SHT_GNU_VERSYM:
+		return "SHT_GNU_VERSYM"
+	default:
+		return fmt.Sprintf("SHT_UNKNOWN(0x%x)", t)
+	}
+}
 
 func (t DT_Tag) Text() string {
 	switch t {
@@ -146,68 +286,69 @@ func (t DT_Tag) Text() string {
 type RelocationType uint32
 
 const (
-	R_AARCH64_NONE      RelocationType = 0x0   // 0
-	R_AARCH64_ABS64     RelocationType = 0x101 // 257 (Direct 64-bit reference)
-	R_AARCH64_ABS32     RelocationType = 0x102 // 258
-	R_AARCH64_ABS16     RelocationType = 0x103 // 259
-	R_AARCH64_PREL64    RelocationType = 0x104 // 260 (PC-relative 64-bit reference)
-	R_AARCH64_PREL32    RelocationType = 0x105 // 261
-	R_AARCH64_PREL16    RelocationType = 0x106 // 262
+	R_AARCH64_NONE   RelocationType = 0x0   // 0
+	R_AARCH64_ABS64  RelocationType = 0x101 // 257 (Direct 64-bit reference)
+	R_AARCH64_ABS32  RelocationType = 0x102 // 258
+	R_AARCH64_ABS16  RelocationType = 0x103 // 259
+	R_AARCH64_PREL64 RelocationType = 0x104 // 260 (PC-relative 64-bit reference)
+	R_AARCH64_PREL32 RelocationType = 0x105 // 261
+	R_AARCH64_PREL16 RelocationType = 0x106 // 262
 
 	// Used for dynamic linker fixups
-	R_AARCH64_COPY      RelocationType = 0x108 // 264
-	R_AARCH64_GLOB_DAT  RelocationType = 0x401 // 1025 (1 + 1024)
-	R_AARCH64_JUMP_SLOT RelocationType = 0x402 // 1026 (2 + 1024)
-	R_AARCH64_RELATIVE  RelocationType = 0x403 // 1027 (3 + 1024)
+	R_AARCH64_COPY       RelocationType = 0x108 // 264
+	R_AARCH64_GLOB_DAT   RelocationType = 0x401 // 1025 (1 + 1024)
+	R_AARCH64_JUMP_SLOT  RelocationType = 0x402 // 1026 (2 + 1024)
+	R_AARCH64_RELATIVE   RelocationType = 0x403 // 1027 (3 + 1024)
 	R_AARCH64_TLS_DTPMOD RelocationType = 0x404 // 1028
 	R_AARCH64_TLS_DTPREL RelocationType = 0x405 // 1029
 
 	// Other commonly used code-related relocations
-	R_AARCH64_ADR_PREL21 RelocationType = 0x113 // 275
+	R_AARCH64_ADR_PREL21      RelocationType = 0x113 // 275
 	R_AARCH64_ADD_ABS_LO12_NC RelocationType = 0x114 // 276
-	R_AARCH64_CALL26    RelocationType = 0x11B // 283
-	R_AARCH64_JUMP26    RelocationType = 0x11C // 284
+	R_AARCH64_CALL26          RelocationType = 0x11B // 283
+	R_AARCH64_JUMP26          RelocationType = 0x11C // 284
 )
+
 func (r RelocationType) Text() string {
-    switch r {
-    case R_AARCH64_NONE:
-        return "R_AARCH64_NONE"
-    case R_AARCH64_ABS64:
-        return "R_AARCH64_ABS64"
-    case R_AARCH64_ABS32:
-        return "R_AARCH64_ABS32"
-    case R_AARCH64_ABS16:
-        return "R_AARCH64_ABS16"
-    case R_AARCH64_PREL64:
-        return "R_AARCH64_PREL64"
-    case R_AARCH64_PREL32:
-        return "R_AARCH64_PREL32"
-    case R_AARCH64_PREL16:
-        return "R_AARCH64_PREL16"
-    case R_AARCH64_COPY:
-        return "R_AARCH64_COPY"
-    case R_AARCH64_ADR_PREL21:
-        return "R_AARCH64_ADR_PREL21"
-    case R_AARCH64_ADD_ABS_LO12_NC:
-        return "R_AARCH64_ADD_ABS_LO12_NC"
-    case R_AARCH64_CALL26:
-        return "R_AARCH64_CALL26"
-    case R_AARCH64_JUMP26:
-        return "R_AARCH64_JUMP26"
-    case R_AARCH64_GLOB_DAT:
-        return "R_AARCH64_GLOB_DAT"
-    case R_AARCH64_JUMP_SLOT:
-        return "R_AARCH64_JUMP_SLOT"
-    case R_AARCH64_RELATIVE:
-        return "R_AARCH64_RELATIVE"
-    case R_AARCH64_TLS_DTPMOD:
-        return "R_AARCH64_TLS_DTPMOD"
-    case R_AARCH64_TLS_DTPREL:
-        return "R_AARCH64_TLS_DTPREL"
-    default:
-        // Default case for unknown relocation types
-        return fmt.Sprintf("UNKNOWN_RELOC_TYPE(%d)", r)
-    }
+	switch r {
+	case R_AARCH64_NONE:
+		return "R_AARCH64_NONE"
+	case R_AARCH64_ABS64:
+		return "R_AARCH64_ABS64"
+	case R_AARCH64_ABS32:
+		return "R_AARCH64_ABS32"
+	case R_AARCH64_ABS16:
+		return "R_AARCH64_ABS16"
+	case R_AARCH64_PREL64:
+		return "R_AARCH64_PREL64"
+	case R_AARCH64_PREL32:
+		return "R_AARCH64_PREL32"
+	case R_AARCH64_PREL16:
+		return "R_AARCH64_PREL16"
+	case R_AARCH64_COPY:
+		return "R_AARCH64_COPY"
+	case R_AARCH64_ADR_PREL21:
+		return "R_AARCH64_ADR_PREL21"
+	case R_AARCH64_ADD_ABS_LO12_NC:
+		return "R_AARCH64_ADD_ABS_LO12_NC"
+	case R_AARCH64_CALL26:
+		return "R_AARCH64_CALL26"
+	case R_AARCH64_JUMP26:
+		return "R_AARCH64_JUMP26"
+	case R_AARCH64_GLOB_DAT:
+		return "R_AARCH64_GLOB_DAT"
+	case R_AARCH64_JUMP_SLOT:
+		return "R_AARCH64_JUMP_SLOT"
+	case R_AARCH64_RELATIVE:
+		return "R_AARCH64_RELATIVE"
+	case R_AARCH64_TLS_DTPMOD:
+		return "R_AARCH64_TLS_DTPMOD"
+	case R_AARCH64_TLS_DTPREL:
+		return "R_AARCH64_TLS_DTPREL"
+	default:
+		// Default case for unknown relocation types
+		return fmt.Sprintf("UNKNOWN_RELOC_TYPE(%d)", r)
+	}
 }
 
 type SymbolBinding uint8
@@ -219,17 +360,17 @@ const (
 )
 
 func (b SymbolBinding) Text() string {
-	switch(b) {
-    case STB_LOCAL:
+	switch b {
+	case STB_LOCAL:
 		return "STB_LOCAL"
-    case STB_GLOBAL:
-        return "STB_GLOBAL"
-    case STB_WEAK:
-        return "STB_WEAK"
-    default:
-        // Default case for unknown symbol binding
-        return fmt.Sprintf("STB_UNKNOWN_BINDING(%d)", b)
-    }
+	case STB_GLOBAL:
+		return "STB_GLOBAL"
+	case STB_WEAK:
+		return "STB_WEAK"
+	default:
+		// Default case for unknown symbol binding
+		return fmt.Sprintf("STB_UNKNOWN_BINDING(%d)", b)
+	}
 }
 
 type SymbolType uint8
@@ -243,7 +384,6 @@ const (
 	STT_COMMON  SymbolType = 5
 	STT_TLS     SymbolType = 6
 )
-
 
 // Helper functions for symbol info
 func (s Elf64_Sym) stBind() SymbolBinding {
@@ -276,5 +416,5 @@ func (r Elf64_Rela) Sym() uint32 {
 
 func PageStart(addr uint64) uint64 {
 	mask := ^(0x1000 - 1)
-    return addr & uint64(mask)
+	return addr & uint64(mask)
 }

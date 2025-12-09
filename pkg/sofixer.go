@@ -6,32 +6,62 @@ import (
 	"io"
 	"os"
 
-	"github.com/fatih/color"
+	"strconv"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/log"
 )
 
 var (
-	debugEnabled bool
-	// Color functions for different elements (Base16 Catppuccin Mocha inspired)
-	cPrefix  = color.New(color.FgHiCyan).SprintFunc()  // Mauve
-	cText    = color.New(color.FgWhite).SprintFunc()   // Text
-	cValue   = color.New(color.FgHiGreen).SprintFunc() // Green
-	fValue   = func(value interface{}) string { return cValue(fmt.Sprintf("%d", value)) }
-	cAddress = color.New(color.FgHiMagenta).SprintFunc() // Blue
-	fAddress = func(addr uint64) string { return cAddress(fmt.Sprintf("0x%x", addr)) }
-	cLabel   = color.New(color.FgHiBlue).SprintFunc()               // Blue
-	cPath    = color.New(color.FgHiYellow).SprintFunc()             // Yellow
-	cSuccess = color.New(color.FgHiYellow, color.Bold).SprintFunc() // Green Bold
-	cWarning = color.New(color.FgHiRed, color.Bold).SprintFunc()    // Orange Bold
+	// Logger instance with custom styles
+	logger *log.Logger
 )
 
-func logDebug(a ...interface{}) {
-	if debugEnabled {
-		fmt.Printf("%s %s\n", cPrefix("[D]"), fmt.Sprint(a...))
-	}
-}
+func init() {
+	// Create custom styles for the logger
+	styles := log.DefaultStyles()
 
-func logInfo(a ...interface{}) {
-	fmt.Printf("%s %s\n", cPrefix("[I]"), fmt.Sprint(a...))
+	// Catppuccin Mocha inspired colors for log levels
+	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
+		SetString("DEBG").
+		Foreground(lipgloss.Color("243")) // Grey
+	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().
+		SetString("INFO").
+		Foreground(lipgloss.Color("86")) // Cyan
+	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().
+		SetString("WARN").
+		Foreground(lipgloss.Color("221")) // Yellow
+	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
+		SetString("ERROR").
+		Foreground(lipgloss.Color("#f38ba8")) // Red
+
+	// Style for keys and values
+	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe"))
+
+	for _, key := range []string{"vaddr", "addr", "offset", "base", "from", "to", "end", "final_va", "maxSegmentEnd"} {
+		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Transform(func(s string) string {
+			if num, err := strconv.Atoi(s); err == nil {
+				return fmt.Sprintf("0x%x", num)
+			}
+			return s
+		})
+	}
+	for _, key := range []string{"type", "tag", "reloc", "bind"} {
+		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
+	}
+	for _, key := range []string{"file", "path"} {
+		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
+	}
+	for _, key := range []string{"name"} {
+		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
+	}
+
+	logger = log.NewWithOptions(os.Stderr, log.Options{
+		ReportTimestamp: false,
+		ReportCaller:    false,
+	})
+	logger.SetStyles(styles)
 }
 
 type ElfReader struct {
@@ -39,7 +69,7 @@ type ElfReader struct {
 	ElfHeader *Elf64_Ehdr
 	Phdrs     []Elf64_Phdr
 	Dyns      []Elf64_Dyn
-	Sections  *[]Elf64_Shdr
+	Sections  []Elf64_Shdr
 	Rel       []Elf64_Rel
 	Rela      []Elf64_Rela
 	JmpRel    []Elf64_Rel
@@ -77,6 +107,10 @@ type ElfReader struct {
 	dynamicOffset uint64
 	dynamicSize   uint64
 
+	// PT_GNU_RELRO
+	relroOffset uint64
+	relroSize   uint64
+
 	// .strtab size
 	strtabSize uint64
 
@@ -92,99 +126,11 @@ const (
 	ET_DYN     = 3
 	EM_AARCH64 = 183
 
-	// Section Header Types (SHT)
-	SHT_NULL        = 0
-	SHT_PROGBITS    = 1
-	SHT_SYMTAB      = 2
-	SHT_STRTAB      = 3
-	SHT_RELA        = 4
-	SHT_HASH        = 5
-	SHT_DYNAMIC     = 6
-	SHT_NOTE        = 7
-	SHT_NOBITS      = 8
-	SHT_REL         = 9
-	SHT_DYNSYM      = 11
-	SHT_INIT_ARRAY  = 14
-	SHT_FINI_ARRAY  = 15
-	SHT_GNU_HASH    = 0x6ffffff6
-	SHT_GNU_VERNEED = 0x6ffffffe
-	SHT_GNU_VERSYM  = 0x6fffffff
-
-	// Section Header Flags (SHF)
 	SHF_WRITE     = 0x1
 	SHF_ALLOC     = 0x2
 	SHF_EXECINSTR = 0x4
 	SHF_INFO_LINK = 0x40
 )
-
-// Elf64_Dyn represents a 64-bit dynamic section entry (Elf64_Dyn).
-type Elf64_Dyn struct {
-	Tag DT_Tag // Dynamic entry type
-	Val uint64 // Value or pointer
-}
-
-// Elf64_Rela represents a 64-bit relocation entry with explicit addend (Elf64_Rela).
-type Elf64_Rela struct {
-	Offset uint64 // Address of reference
-	Info   uint64 // Symbol index and type of relocation
-	Addend int64  // Constant addend
-}
-
-// Elf64_Rel represents a 64-bit relocation entry without addend (Elf64_Rel).
-type Elf64_Rel struct {
-	Offset uint64 // Address of reference
-	Info   uint64 // Symbol index and type of relocation
-}
-
-// Elf64_Shdr represents a 64-bit section header entry (Elf64_Shdr).
-type Elf64_Shdr struct {
-	Name      uint32 // Section name (index into string table)
-	Type      uint32 // Section type
-	Flags     uint64 // Section flags
-	Addr      uint64 // Address in memory
-	Offset    uint64 // Offset in file
-	Size      uint64 // Size of section in file
-	Link      uint32 // Link to another section
-	Info      uint32 // Additional section information
-	Addralign uint64 // Section alignment
-	Entsize   uint64 // Size of entries in section
-}
-
-// Elf64_Ehdr represents the main ELF header structure (e_ident + rest of header).
-type Elf64_Ehdr struct {
-	Magic      [4]byte // 0x00-0x03: Magic number
-	Class      uint8   // 0x04: 32-bit or 64-bit
-	Data       uint8   // 0x05: Little or big endian
-	Version    uint8   // 0x06: ELF version
-	OSABI      uint8   // 0x07: OS/ABI identification
-	ABIVersion uint8   // 0x08: ABI version
-	Padding    [7]byte // 0x09-0x0F: Unused
-	Type       uint16  // 0x10-0x11: object file type
-	Machine    uint16  // 0x12-0x13: architecture
-	Version2   uint32  // 0x14-0x17: ELF version (again)
-	Entry      uint64  // 0x18-0x1F: entry point virtual address
-	PhdrOffset uint64  // 0x20-0x27: program header table file offset
-	ShdrOffset uint64  // 0x28-0x2F: section header table file offset
-	Flags      uint32  // 0x30-0x33: processor specific flags
-	Ehsize     uint16  // 0x34-0x35: ELF header size
-	Phentsize  uint16  // 0x36-0x37: size of an entry in the program header table
-	Phnum      uint16  // 0x38-0x39: number of entries in the program header table
-	Shentsize  uint16  // 0x3A-0x3B: size of an entry in the section header table
-	Shnum      uint16  // 0x3C-0x3D: number of entries in the section header table
-	Shstrndx   uint16  // 0x3E-0x3F: section header string table index
-}
-
-// Elf64_Phdr represents a 64-bit program header entry (Elf64_Phdr).
-type Elf64_Phdr struct {
-	Type   PT_Type // Segment type
-	Flags  uint32  // Segment flags
-	Offset uint64  // Segment file offset
-	Vaddr  uint64  // Segment virtual address
-	Paddr  uint64  // Segment physical address
-	Filesz uint64  // Segment file size
-	Memsz  uint64  // Segment memory size
-	Align  uint64  // Segment alignment
-}
 
 // HashHeader represents the initial part of the DT_HASH table.
 type HashHeader struct {
@@ -200,15 +146,6 @@ type GNUHashHeader struct {
 	Shift2    uint32
 }
 
-type Elf64_Sym struct {
-	St_Name  uint32 // Symbol name (index into string table)
-	St_Info  uint8  // Symbol type and binding attributes
-	St_Other uint8  // Visibility and other attributes
-	St_Shndx uint16 // Section index where the symbol is defined
-	St_Value uint64 // Value of the symbol (address or offset)
-	St_Size  uint64 // Size of the symbol
-}
-
 // alignUp rounds up 'value' to the next multiple of 'align'
 func alignUp(value, align uint64) uint64 {
 	if align == 0 {
@@ -219,8 +156,12 @@ func alignUp(value, align uint64) uint64 {
 
 // FixELFHeaders attempts to fix common issues with ELF headers.
 func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bool) error {
-	debugEnabled = debug
-	logInfo(cText("Starting ELF fix for file: "), cPath(filePath), cText(" at base address "), fAddress(baseAddr))
+	if debug {
+		logger.SetLevel(log.DebugLevel)
+	} else {
+		logger.SetLevel(log.InfoLevel)
+	}
+	logger.Info("Starting ELF fix", "file", filePath, "base", baseAddr)
 
 	file, err := os.OpenFile(filePath, os.O_RDWR, 0)
 	if err != nil {
@@ -271,7 +212,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bo
 }
 
 func (r *ElfReader) ReadElfHeaders() error {
-	logInfo(cText("* Reading and validating ELF header..."))
+	logger.Info("Reading and validating ELF header")
 	if err := binary.Read(r.File, binary.LittleEndian, r.ElfHeader); err != nil {
 		return fmt.Errorf("failed to read ELF header: %w", err)
 	}
@@ -284,7 +225,7 @@ func (r *ElfReader) ReadElfHeaders() error {
 	if r.ElfHeader.Phentsize != 56 {
 		return fmt.Errorf("invalid program header entry size: %d (expected 56)", r.ElfHeader.Phentsize)
 	}
-	logInfo(cSuccess("   -> ELF header validated"), cText("(64-bit, Phentsize "), fValue(r.ElfHeader.Phentsize), cText(")"))
+	logger.Info("ELF header validated", "class", "64-bit", "phentsize", r.ElfHeader.Phentsize)
 
 	return nil
 }
@@ -294,22 +235,38 @@ func (r *ElfReader) ReadPhdrs() error {
 	if phtSize == 0 || r.ElfHeader.Phnum > 1024 {
 		return fmt.Errorf("invalid number of program headers: %d", r.ElfHeader.Phnum)
 	}
-	logInfo(cText("* Reading PHT at offset "), fAddress(r.ElfHeader.PhdrOffset), cText(" e_phnum="), fValue(r.ElfHeader.Phnum))
+	logger.Info("Reading PHT", "offset", r.ElfHeader.PhdrOffset, "entries", r.ElfHeader.Phnum)
 
-	if _, err := r.File.Seek(int64(r.ElfHeader.PhdrOffset), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to program header table: %w", err)
+	var err error
+	if r.Phdrs, err = readArray[Elf64_Phdr](r.File, r.ElfHeader.PhdrOffset, uint64(r.ElfHeader.Phnum), "PT_PHDR"); err != nil {
+		return err
 	}
 
-	r.Phdrs = make([]Elf64_Phdr, r.ElfHeader.Phnum)
-	if err := binary.Read(r.File, binary.LittleEndian, r.Phdrs); err != nil {
-		return fmt.Errorf("failed to read program header table: %w", err)
-	}
+	for i := range r.Phdrs {
+		phdr := &r.Phdrs[i]
 
-	for _, phdr := range r.Phdrs {
 		if phdr.Type == PT_LOAD && r.phdrPtLoadPageStart == 0 {
 			r.phdrPtLoadPageStart = PageStart(phdr.Vaddr)
 		}
-		logDebug(cText("  + "), cValue(phdr.Type.Text()), cText(" at "), fAddress(phdr.Offset))
+
+		if phdr.Type == PT_GNU_RELRO {
+			r.relroOffset = phdr.Vaddr
+			r.relroSize = phdr.Memsz
+
+			// Fix RELRO offset based on parent PT_LOAD
+			for _, parent := range r.Phdrs {
+				if parent.Type == PT_LOAD && phdr.Vaddr >= parent.Vaddr && (phdr.Vaddr+phdr.Memsz) <= (parent.Vaddr+parent.Memsz) {
+					expectedOffset := parent.Offset + (phdr.Vaddr - parent.Vaddr)
+					if phdr.Offset != expectedOffset {
+						logger.Debug("Fixing PT_GNU_RELRO offset", "from", fmt.Sprintf("0x%x", phdr.Offset), "to", fmt.Sprintf("0x%x", expectedOffset))
+						phdr.Offset = expectedOffset
+					}
+					break
+				}
+			}
+		}
+
+		logger.Debug("  + header", "type", phdr.Type.Text(), "offset", phdr.Offset)
 	}
 
 	return nil
@@ -328,37 +285,27 @@ func (r *ElfReader) ReadDyns() error {
 		return nil
 	}
 
-	logInfo(cText("* Reading DYN at offset "), fAddress(dynamicPhdr.Offset))
-
-	entryCount := dynamicPhdr.Memsz / 16
+	entryCount := dynamicPhdr.Memsz / uint64(binary.Size(Elf64_Dyn{}))
+	logger.Info("Reading DYN", "offset", dynamicPhdr.Offset, "entries", entryCount)
 
 	if entryCount == 0 {
 		return fmt.Errorf("dynamic section has zero size")
 	}
-	logDebug(cText("   -> Dynamic section found p_vaddr="), fAddress(dynamicPhdr.Vaddr), cText(", p_offset="), fAddress(dynamicPhdr.Offset), cText(", entries="), fValue(entryCount))
+	logger.Debug("Dynamic section found", "vaddr", dynamicPhdr.Vaddr, "offset", dynamicPhdr.Offset, "entries", entryCount)
 
 	// Store dynamic section info
 	r.dynamicOffset = dynamicPhdr.Vaddr
 	r.dynamicSize = dynamicPhdr.Memsz
 
 	// Read the dynamic section content
-	r.Dyns = make([]Elf64_Dyn, entryCount)
-
-	// For memory dumps, use p_vaddr as the file offset since the dump is sequential by VA
-	// For regular ELF files, p_offset would be correct, but memory dumps don't follow that
-	logDebug(cText("   -> Using vaddr as file offset: "), fAddress(r.dynamicOffset))
-
-	if _, err := r.File.Seek(int64(r.dynamicOffset), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to dynamic section: %w", err)
-	}
-
-	if err := binary.Read(r.File, binary.LittleEndian, r.Dyns); err != nil {
-		return fmt.Errorf("failed to read dynamic section: %w", err)
+	var err error
+	if r.Dyns, err = readArray[Elf64_Dyn](r.File, r.dynamicOffset, entryCount, "DT_DYNAMIC"); err != nil {
+		return err
 	}
 
 	r.dynMap = make(map[DT_Tag]uint64)
 	for _, entry := range r.Dyns {
-		baseLog := fValue(entry.Val)
+		baseLog := entry.Val
 		switch entry.Tag {
 		case DT_STRTAB:
 			r.strtabOffset = entry.Val
@@ -399,7 +346,7 @@ func (r *ElfReader) ReadDyns() error {
 		case DT_STRSZ:
 			r.strtabSize = entry.Val
 		}
-		logInfo(cText("    - dynamic "), cLabel(entry.Tag.Text()), cText(" "), baseLog)
+		logger.Debug("  + dynamic", "tag", entry.Tag.Text(), "val", baseLog)
 		r.dynMap[entry.Tag] = entry.Val
 	}
 
@@ -412,59 +359,37 @@ func (r *ElfReader) ReadRelocs() error {
 		return fmt.Errorf("failed to calculate symbol count: %w", err)
 	}
 
-	logInfo(cText("* Found "), fValue(r.symCount), cText(" symbols"))
-	r.Symbols = make([]Elf64_Sym, r.symCount)
-	if r.symCount > 0 && r.symtabOffset != 0 {
-		if _, err := r.File.Seek(int64(r.symtabOffset), io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek to symbol table: %w", err)
-		}
-		if err := binary.Read(r.File, binary.LittleEndian, r.Symbols); err != nil {
-			logDebug(cWarning("   -> Warning: failed to read symbol table: "), cText(err.Error()))
-		}
+	logger.Info("Found symbols", "count", r.symCount)
+	if r.Symbols, err = readArray[Elf64_Sym](r.File, r.symtabOffset, r.symCount, "DT_SYMTAB"); err != nil {
+		return err
 	}
 
 	if r.relOffset != 0 {
-		relCount := r.relSize / 16
-		logInfo(cText(" + DT_REL at "), fAddress(r.relOffset), cText(" count="), fValue(relCount))
-		r.Rel = make([]Elf64_Rel, relCount)
-		if _, err = r.File.Seek(int64(r.relOffset), io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek to rel table: %w", err)
-		}
-		if err = binary.Read(r.File, binary.LittleEndian, r.Rel); err != nil {
-			return fmt.Errorf("failed to read rel table: %w", err)
+		relCount := r.relSize / uint64(binary.Size(Elf64_Rel{}))
+		logger.Info("  +", "reloc", "DT_REL", "offset", r.relOffset, "count", relCount)
+		if r.Rel, err = readArray[Elf64_Rel](r.File, r.relOffset, relCount, "DT_REL"); err != nil {
+			return err
 		}
 	}
 	if r.relaOffset != 0 {
-		relaCount := r.relaSize / 24
-		logInfo(cText(" + DT_RELA at "), fAddress(r.relaOffset), cText(" count="), fValue(relaCount))
-		r.Rela = make([]Elf64_Rela, relaCount)
-		if _, err = r.File.Seek(int64(r.relaOffset), io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek to rela table: %w", err)
-		}
-		if err = binary.Read(r.File, binary.LittleEndian, r.Rela); err != nil {
-			return fmt.Errorf("failed to read rela table: %w", err)
+		relaCount := r.relaSize / uint64(binary.Size(Elf64_Rela{}))
+		logger.Info("  +", "reloc", "DT_RELA", "offset", r.relaOffset, "count", relaCount)
+		if r.Rela, err = readArray[Elf64_Rela](r.File, r.relaOffset, relaCount, "DT_RELA"); err != nil {
+			return err
 		}
 	}
 	if r.jmprelOffset != 0 {
 		if r.jmprelEntry == 16 {
-			jmprelCount := r.jmprelSize / 16
-			logInfo(cText(" + DT_JMPREL at "), fAddress(r.jmprelOffset), cText(" count="), fValue(jmprelCount))
-			r.JmpRel = make([]Elf64_Rel, jmprelCount)
-			if _, err = r.File.Seek(int64(r.jmprelOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek to jmprel table: %w", err)
-			}
-			if err = binary.Read(r.File, binary.LittleEndian, r.JmpRel); err != nil {
-				return fmt.Errorf("failed to read jmprel table: %w", err)
+			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rel{}))
+			logger.Info("  +", "reloc", "DT_JMPREL", "offset", r.jmprelOffset, "count", jmprelCount)
+			if r.JmpRel, err = readArray[Elf64_Rel](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
+				return err
 			}
 		} else {
-			jmprelCount := r.jmprelSize / 24
-			logInfo(cText(" + DT_JMPREL at "), fAddress(r.jmprelOffset), cText(" count="), fValue(jmprelCount))
-			r.JmpRela = make([]Elf64_Rela, jmprelCount)
-			if _, err = r.File.Seek(int64(r.jmprelOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek to jmprel table: %w", err)
-			}
-			if err = binary.Read(r.File, binary.LittleEndian, r.JmpRela); err != nil {
-				return fmt.Errorf("failed to read jmprel table: %w", err)
+			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rela{}))
+			logger.Info("  +", "reloc", "DT_JMPREL", "offset", r.jmprelOffset, "count", jmprelCount)
+			if r.JmpRela, err = readArray[Elf64_Rela](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
+				return err
 			}
 		}
 	}
@@ -516,7 +441,7 @@ func (r *ElfReader) FixRelocs(base uint64) error {
 		rname := readStrtabString(r.File, r.strtabOffset, rsym.St_Name)
 
 		// L: Location (Address of the relocation site in memory, treating base as 0)
-		// L := base + rel.Offset
+		L := base + rel.Offset
 		// S: Symbol Value (runtime address, which is now the intended virtual address)
 		S := rsym.St_Value
 
@@ -536,13 +461,14 @@ func (r *ElfReader) FixRelocs(base uint64) error {
 			// P = S + A (A is original value at L)
 			// Assuming A=0 for this Rel handler.
 			P = S
-
+		case R_AARCH64_RELATIVE:
+			P = L
 		default:
 			P = S
 		}
 
 		rel.Offset = P
-		logDebug(cText("    - rel "), cLabel(relocType.Text()), cText(" "), cValue(rname), cText(" final VA "), fAddress(P))
+		logger.Debug("  +rel", "type", relocType.Text(), "sym", rname, "final_va", P)
 	}
 
 	// --- Helper function for Rela (Relocation with Explicit Addend) ---
@@ -594,22 +520,22 @@ func (r *ElfReader) FixRelocs(base uint64) error {
 
 		// Store the calculated intended Virtual Address (VA) in the Offset field.
 		rela.Offset = P
-		logDebug(cText("    - rela "), cLabel(relocType.Text()), cText(" "), cValue(rname), cText(" final VA "), fAddress(P))
+		logger.Debug("  + rela", "type", relocType.Text(), "sym", rname, "final_va", P)
 
 	}
 
 	// --- Execute Relocations ---
-	for _, rel := range r.Rel {
-		fnRel(&rel)
+	for i := range r.Rel {
+		fnRel(&r.Rel[i])
 	}
-	for _, rela := range r.Rela {
-		fnRela(&rela)
+	for i := range r.Rela {
+		fnRela(&r.Rela[i])
 	}
-	for _, jmprel := range r.JmpRel {
-		fnRel(&jmprel)
+	for i := range r.JmpRel {
+		fnRel(&r.JmpRel[i])
 	}
-	for _, jmprela := range r.JmpRela {
-		fnRela(&jmprela)
+	for i := range r.JmpRela {
+		fnRela(&r.JmpRela[i])
 	}
 
 	return nil
@@ -617,10 +543,10 @@ func (r *ElfReader) FixRelocs(base uint64) error {
 
 // BuildStrtab builds a new string table with all symbol names
 func (r *ElfReader) BuildStrtab() error {
-	logInfo(cText("* Building new string table..."))
+	logger.Info("Building new string table")
 
 	if len(r.Symbols) == 0 {
-		logInfo(cWarning("   -> No symbols to process, skipping string table build"))
+		logger.Warn("No symbols to process, skipping string table build")
 		r.newStrtab = []byte{0}
 		r.newStrtabMap = make(map[string]uint32)
 		r.newSymbols = []Elf64_Sym{{}} // Just null symbol
@@ -666,16 +592,13 @@ func (r *ElfReader) BuildStrtab() error {
 		// Read original symbol name
 		symName := readStrtabString(r.File, r.strtabOffset, sym.St_Name)
 
-		logDebug(cText("      - Symbol["), fValue(i), cText("]: "), cValue(symName),
-			cText(" value="), fAddress(sym.St_Value),
-			cText(" "), cLabel(sym.stBind().Text()))
+		logger.Debug("Symbol", "idx", i, "name", symName, "value", sym.St_Value, "bind", sym.stBind().Text())
 
 		// Update name offset in new strtab
 		sym.St_Name = addString(symName)
 
 		// Separate local and global symbols (ELF requires locals first)
 		bind := sym.stBind()
-		logDebug(cText("        -> Binding: "), cValue(bind.Text()), cText(" ("), fValue(bind), cText(")"))
 		if bind == STB_LOCAL {
 			localSymbols = append(localSymbols, sym)
 		} else {
@@ -687,10 +610,7 @@ func (r *ElfReader) BuildStrtab() error {
 	r.newSymbols = append(r.newSymbols, localSymbols...)
 	r.newSymbols = append(r.newSymbols, globalSymbols...)
 
-	logInfo(cText("   -> Built string table: "), fValue(len(r.newStrtab)), cText(" bytes, "),
-		fValue(len(r.newSymbols)), cText(" symbols ("),
-		fValue(len(localSymbols)), cText(" local, "),
-		fValue(len(globalSymbols)), cText(" global)"))
+	logger.Info("Built string table", "size", len(r.newStrtab), "null", 1, "local", len(localSymbols), "global", len(globalSymbols))
 
 	return nil
 }
@@ -715,12 +635,10 @@ func (r *ElfReader) WriteFixedElf(outputPath string, baseAddr uint64) error {
 func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, error) {
 	hashOffset := dynMap[DT_HASH]
 	gnuHashOffset := dynMap[DT_GNU_HASH]
-	symtabOffset := dynMap[DT_SYMTAB]
-	symEntSize := dynMap[DT_SYMENT]
 
 	if hashOffset != 0 {
 		var header HashHeader
-		logInfo("using DT_HASH")
+		logger.Info("Using DT_HASH for symbol count")
 
 		if _, err := file.Seek(int64(hashOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("failed to seek to hash table: %w", err)
@@ -735,7 +653,7 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 	if gnuHashOffset != 0 {
 		// 1. Read GNU Hash Header
 		var header GNUHashHeader
-		logInfo("using DT_GNU_HASH")
+		logger.Info("Using DT_GNU_HASH for symbol count")
 
 		if _, err := file.Seek(int64(gnuHashOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("failed to seek to GNU hash table: %w", err)
@@ -810,10 +728,6 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 		}
 
 		return maxSymIndex + 1, nil
-	}
-
-	if symtabOffset != 0 && dynMap[DT_STRSZ] != 0 {
-		return (dynMap[DT_STRSZ] / 10) * symEntSize, nil
 	}
 
 	return 0, fmt.Errorf("missing DT_HASH or DT_GNU_HASH or DT_SYMTAB/DT_SYMENT")
@@ -902,4 +816,45 @@ func readStrtabString(file *os.File, strtabOffset uint64, nameOffset uint32) str
 	}
 
 	return string(result)
+}
+
+// readIntoArray reads up to 'count' elements of type T from file at the given offset.
+// Returns the successfully read elements and the actual count. On EOF, returns partial results without error.
+func readArray[T any](file *os.File, offset uint64, count uint64, name string) ([]T, error) {
+	if count == 0 {
+		return []T{}, nil
+	}
+
+	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
+	}
+
+	// Try to read the full array first (most efficient for common case)
+	array := make([]T, count)
+	if err := binary.Read(file, binary.LittleEndian, array); err == nil {
+		return array, nil
+	}
+
+	// On error, fall back to reading element by element for partial results
+	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
+	}
+
+	result := make([]T, 0, count)
+	for i := uint64(0); i < count; i++ {
+		var elem T
+		if err := binary.Read(file, binary.LittleEndian, &elem); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				// Return what we have so far
+				if len(result) > 0 {
+					logger.Warn("partial read", "name", name, "expected", count, "got", len(result))
+				}
+				return result, nil
+			}
+			return nil, fmt.Errorf("failed to read %s element %d at 0x%x: %w", name, i, offset, err)
+		}
+		result = append(result, elem)
+	}
+
+	return result, nil
 }

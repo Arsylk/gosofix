@@ -79,7 +79,7 @@ func (rb *ElfRebuilder) vaddrToOffset(vaddr uint64) uint64 {
 }
 
 // addSection adds a new section to the rebuilder
-func (rb *ElfRebuilder) addSection(name string, shType uint32, flags uint64, addr uint64, data []byte, link uint32, info uint32, addralign uint64, entsize uint64) int {
+func (rb *ElfRebuilder) addSection(name string, shType SHT_Type, flags uint64, addr uint64, data []byte, link uint32, info uint32, addralign uint64, entsize uint64) int {
 	nameOffset := rb.addShstrtabString(name)
 
 	// Convert virtual address to file offset
@@ -111,7 +111,7 @@ func (rb *ElfRebuilder) addSection(name string, shType uint32, flags uint64, add
 
 // addSectionHeader adds a section header for data already in PT_LOAD segments
 // This does NOT store any data - the section just points to existing segment data
-func (rb *ElfRebuilder) addSectionHeader(name string, shType uint32, flags uint64, addr uint64, size uint64, link uint32, info uint32, addralign uint64, entsize uint64) int {
+func (rb *ElfRebuilder) addSectionHeader(name string, shType SHT_Type, flags uint64, addr uint64, size uint64, link uint32, info uint32, addralign uint64, entsize uint64) int {
 	nameOffset := rb.addShstrtabString(name)
 
 	// Convert virtual address to file offset
@@ -139,7 +139,7 @@ func (rb *ElfRebuilder) addSectionHeader(name string, shType uint32, flags uint6
 
 // buildSections creates all necessary sections from the ElfReader data
 func (rb *ElfRebuilder) buildSections() error {
-	logInfo(cText("* Building ELF sections..."))
+	logger.Info("Building ELF sections")
 
 	// 1. NULL section (required)
 	rb.nullSectionIdx = rb.addSection("", SHT_NULL, 0, 0, nil, 0, 0, 0, 0)
@@ -154,7 +154,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			rb.reader.newStrtab,
 			0, 0, 1, 0,
 		)
-		logInfo(cText("   + .dynstr: "), fValue(len(rb.reader.newStrtab)), cText(" bytes"))
+		logger.Info(".dynstr", "size", len(rb.reader.newStrtab))
 	}
 
 	// 3. .dynsym section (dynamic symbol table)
@@ -179,7 +179,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			localCount,
 			8, 24,
 		)
-		logInfo(cText("   + .dynsym: "), fValue(len(rb.reader.newSymbols)), cText(" symbols"))
+		logger.Info(".dynsym", "count", len(rb.reader.newSymbols))
 	}
 
 	// 4. .hash section (if present)
@@ -193,7 +193,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 4,
 		)
-		logInfo(cText("   + .hash: "), fValue(rb.reader.hashSize), cText(" bytes"))
+		logger.Info(".hash", "size", rb.reader.hashSize)
 	}
 
 	// 5. .gnu.hash section (if present)
@@ -207,7 +207,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 0,
 		)
-		logInfo(cText("   + .gnu.hash: "), fValue(rb.reader.gnuHashSize), cText(" bytes"))
+		logger.Info(".gnu.hash", "size", rb.reader.gnuHashSize)
 	}
 
 	// 6. .rela.dyn section (RELA relocations)
@@ -223,7 +223,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 24,
 		)
-		logInfo(cText("   + .rela.dyn: "), fValue(len(rb.reader.Rela)), cText(" entries"))
+		logger.Info(".rela.dyn", "count", len(rb.reader.Rela))
 	}
 
 	// 7. .rel.dyn section (REL relocations)
@@ -239,7 +239,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 16,
 		)
-		logInfo(cText("   + .rel.dyn: "), fValue(len(rb.reader.Rel)), cText(" entries"))
+		logger.Info(".rel.dyn", "count", len(rb.reader.Rel))
 	}
 
 	// 8. .rela.plt or .rel.plt section (PLT relocations)
@@ -255,7 +255,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 24,
 		)
-		logInfo(cText("   + .rela.plt: "), fValue(len(rb.reader.JmpRela)), cText(" entries"))
+		logger.Info(".rela.plt", "count", len(rb.reader.JmpRela))
 	} else if len(rb.reader.JmpRel) > 0 {
 		jmpRelData := makeBytes(rb.reader.JmpRel)
 
@@ -268,7 +268,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynsymSectionIdx),
 			0, 8, 16,
 		)
-		logInfo(cText("   + .rel.plt: "), fValue(len(rb.reader.JmpRel)), cText(" entries"))
+		logger.Info(".rel.plt", "count", len(rb.reader.JmpRel))
 	}
 
 	// 9. .dynamic section
@@ -282,7 +282,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			uint32(rb.dynstrSectionIdx),
 			0, 8, 16,
 		)
-		logInfo(cText("   + .dynamic: "), fValue(rb.reader.dynamicSize/16), cText(" entries"))
+		logger.Info(".dynamic", "count", rb.reader.dynamicSize/16)
 	}
 
 	// 10. .got section (Global Offset Table)
@@ -295,7 +295,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			rb.reader.gotSize,
 			0, 0, 8, 8,
 		)
-		logInfo(cText("   + .got: "), fValue(rb.reader.gotSize), cText(" bytes"))
+		logger.Info(".got", "size", rb.reader.gotSize)
 	}
 
 	// 11. .init_array section
@@ -308,7 +308,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			rb.reader.initArraySize,
 			0, 0, 8, 8,
 		)
-		logInfo(cText("   + .init_array: "), fValue(rb.reader.initArraySize), cText(" bytes"))
+		logger.Info(".init_array", "size", rb.reader.initArraySize)
 	}
 
 	// 12. .fini_array section
@@ -321,7 +321,7 @@ func (rb *ElfRebuilder) buildSections() error {
 			rb.reader.finiArraySize,
 			0, 0, 8, 8,
 		)
-		logInfo(cText("   + .fini_array: "), fValue(rb.reader.finiArraySize), cText(" bytes"))
+		logger.Info(".fini_array", "size", rb.reader.finiArraySize)
 	}
 
 	// 13. .shstrtab section (section header string table) - must be last
@@ -339,7 +339,7 @@ func (rb *ElfRebuilder) buildSections() error {
 		0, 0, 1, 0,
 	)
 
-	logInfo(cSuccess("   -> Created "), fValue(len(rb.sections)), cText(" sections"))
+	logger.Info("Created sections", "count", len(rb.sections))
 
 	return nil
 }
@@ -356,7 +356,7 @@ func makeBytes[T any](data []T) []byte {
 
 // calculateLayout determines file offsets for all sections
 func (rb *ElfRebuilder) calculateLayout() error {
-	logInfo(cText("* Calculating section layout..."))
+	logger.Info("Calculating section layout")
 
 	// Find the end of all PT_LOAD segments to know where we can place sections
 	maxSegmentEnd := uint64(0)
@@ -375,7 +375,7 @@ func (rb *ElfRebuilder) calculateLayout() error {
 	// Align to 8 bytes
 	rb.currentOffset = alignUp(rb.currentOffset, 8)
 
-	logDebug(cText("   + Starting section layout at offset "), fAddress(rb.currentOffset))
+	logger.Debug("Starting section layout", "offset", fmt.Sprintf("0x%x", rb.currentOffset))
 
 	// Layout all sections
 	// Most sections already have their offsets set from vaddrToOffset
@@ -387,7 +387,7 @@ func (rb *ElfRebuilder) calculateLayout() error {
 
 		// Skip sections that already have offsets (they're in PT_LOAD segments)
 		if rb.sections[i].Offset != 0 && rb.sections[i].Addr != 0 {
-			logDebug(cText("   + Section "), fValue(i), cText(" already at offset "), fAddress(rb.sections[i].Offset))
+			logger.Debug("Section", "idx", i, "status", "existing", "offset", fmt.Sprintf("0x%x", rb.sections[i].Offset))
 			continue
 		}
 
@@ -399,8 +399,7 @@ func (rb *ElfRebuilder) calculateLayout() error {
 		rb.sections[i].Offset = rb.currentOffset
 		rb.currentOffset += rb.sections[i].Size
 
-		logDebug(cText("   + Section "), fValue(i), cText(" placed at offset "), fAddress(rb.sections[i].Offset),
-			cText(", size "), fValue(rb.sections[i].Size))
+		logger.Debug("Section", "idx", i, "offset", fmt.Sprintf("0x%x", rb.sections[i].Offset), "size", rb.sections[i].Size)
 	}
 
 	// Align section header table
@@ -411,19 +410,16 @@ func (rb *ElfRebuilder) calculateLayout() error {
 	// - Sections point to data within segments
 	// - But segments may extend beyond the last section
 	// Start from maxSegmentEnd (calculated earlier) which is the end of all PT_LOAD data
-	logDebug(cText("   + Finding max section extent, maxSegmentEnd was "), fAddress(maxSegmentEnd))
+	logger.Debug("Finding max section extent", "maxSegmentEnd", fmt.Sprintf("0x%x", maxSegmentEnd))
 	maxExtent := maxSegmentEnd
 
 	// Also check all sections in case any extend beyond segments (like .shstrtab)
 	for i, section := range rb.sections {
 		if section.Type != SHT_NULL {
 			sectionEnd := section.Offset + section.Size
-			logDebug(cText("     - Section "), fValue(i),
-				cText(" offset="), fAddress(section.Offset),
-				cText(" size="), fValue(section.Size),
-				cText(" end="), fAddress(sectionEnd))
+			logger.Debug("Section", "idx", i, "offset", fmt.Sprintf("0x%x", section.Offset), "size", section.Size, "end", fmt.Sprintf("0x%x", sectionEnd))
 			if sectionEnd > maxExtent {
-				logDebug(cText("       -> New max: "), fAddress(sectionEnd))
+				logger.Debug("New max", "end", fmt.Sprintf("0x%x", sectionEnd))
 				maxExtent = sectionEnd
 			}
 		}
@@ -432,19 +428,34 @@ func (rb *ElfRebuilder) calculateLayout() error {
 	// Place section header table after everything
 	rb.currentOffset = alignUp(maxExtent, 8)
 
-	logInfo(cText("   -> Section header table at "), fAddress(rb.currentOffset))
-	logInfo(cText("   -> Total file size: "), fValue(rb.currentOffset+uint64(len(rb.sections))*64), cText(" bytes"))
+	logger.Info("Section header table", "offset", fmt.Sprintf("0x%x", rb.currentOffset))
+	logger.Info("Total file size", "bytes", rb.currentOffset+uint64(len(rb.sections))*64)
 
 	return nil
 }
 
 // writeRelocations writes the rebuilt ELF file with all sections
 func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
-	logInfo(cText("* Writing rebuilt ELF file..."))
+	logger.Info("Writing rebuilt ELF file")
 
 	// Build sections
 	if err := rb.buildSections(); err != nil {
 		return fmt.Errorf("failed to build sections: %w", err)
+	}
+
+	// For memory dumps, we want to capture the full memory size of segments,
+	// including the BSS (uninitialized data) which might contain runtime values.
+	// So we expand Filesz to equal Memsz for all PT_LOAD segments.
+	for i := range rb.reader.Phdrs {
+		if rb.reader.Phdrs[i].Type == PT_LOAD {
+			if rb.reader.Phdrs[i].Filesz < rb.reader.Phdrs[i].Memsz {
+				logger.Info("Expanding segment to full memory size",
+					"segment", i,
+					"old_filesz", rb.reader.Phdrs[i].Filesz,
+					"new_filesz", rb.reader.Phdrs[i].Memsz)
+				rb.reader.Phdrs[i].Filesz = rb.reader.Phdrs[i].Memsz
+			}
+		}
 	}
 
 	// Calculate layout
@@ -454,15 +465,15 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 
 	// Update ELF header
 	newHeader := *rb.reader.ElfHeader
-	logDebug(cText("   + Original e_shoff: "), fAddress(newHeader.ShdrOffset))
-	logDebug(cText("   + rb.currentOffset: "), fAddress(rb.currentOffset))
+	logger.Debug("Original e_shoff", "offset", fmt.Sprintf("0x%x", newHeader.ShdrOffset))
+	logger.Debug("rb.currentOffset", "offset", fmt.Sprintf("0x%x", rb.currentOffset))
 	newHeader.ShdrOffset = rb.currentOffset
 	newHeader.Shnum = uint16(len(rb.sections))
 	newHeader.Shstrndx = uint16(rb.shstrtabSectionIdx)
 
-	logDebug(cText("   + Setting e_shoff to "), fAddress(newHeader.ShdrOffset))
-	logDebug(cText("   + Setting e_shnum to "), fValue(newHeader.Shnum))
-	logDebug(cText("   + Setting e_shstrndx to "), fValue(newHeader.Shstrndx))
+	logger.Debug("Setting e_shoff", "val", fmt.Sprintf("0x%x", newHeader.ShdrOffset))
+	logger.Debug("Setting e_shnum", "val", newHeader.Shnum)
+	logger.Debug("Setting e_shstrndx", "val", newHeader.Shstrndx)
 
 	// Write ELF header
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -471,7 +482,7 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 	if err := binary.Write(file, binary.LittleEndian, newHeader); err != nil {
 		return fmt.Errorf("failed to write ELF header: %w", err)
 	}
-	logInfo(cText("   + Wrote ELF header"))
+	logger.Info("Wrote ELF header")
 
 	// Copy program headers from original file
 	if _, err := file.Seek(int64(newHeader.PhdrOffset), io.SeekStart); err != nil {
@@ -480,7 +491,14 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 	if err := binary.Write(file, binary.LittleEndian, rb.reader.Phdrs); err != nil {
 		return fmt.Errorf("failed to write program headers: %w", err)
 	}
-	logInfo(cText("   + Wrote program headers"))
+	logger.Info("Wrote program headers")
+
+	var fileSize uint64 = 0
+	if stat, err := rb.reader.File.Stat(); err == nil {
+		fileSize = uint64(stat.Size())
+	} else {
+		return fmt.Errorf("failed to stat source file: %w", err)
+	}
 
 	// Copy segment data from original file (the actual program code/data)
 	// For memory dumps: data is at VADDR positions in the source file
@@ -501,18 +519,19 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 				srcOffset += headerAndPhdrSize
 				dstOffset = headerAndPhdrSize
 				copySize = phdr.Filesz - headerAndPhdrSize
-				logDebug(cText("   + Skipping ELF+program headers ("), fValue(headerAndPhdrSize),
-					cText(" bytes) for segment "), fValue(i))
+				logger.Debug("Skipping ELF headers", "size", headerAndPhdrSize, "segment", i)
 			}
 
 			if copySize == 0 {
 				continue
 			}
 
-			logDebug(cText("   + Copying PT_LOAD segment "), fValue(i),
-				cText(" from vaddr "), fAddress(srcOffset),
-				cText(" to offset "), fAddress(dstOffset),
-				cText(" size "), fValue(copySize))
+			logger.Debug("Copying PT_LOAD segment", "idx", i, "vaddr", fmt.Sprintf("0x%x", srcOffset), "offset", fmt.Sprintf("0x%x", dstOffset), "size", copySize)
+
+			if srcOffset+copySize > fileSize {
+				copySize = uint64(max(int64(fileSize)-int64(srcOffset), 0))
+				logger.Warn("Truncated segment", "size", copySize)
+			}
 
 			// Read from original file (memory dump - data at vaddr positions)
 			segmentData := make([]byte, copySize)
@@ -520,7 +539,7 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 				return fmt.Errorf("failed to seek to segment %d in source: %w", i, err)
 			}
 			if _, err := io.ReadFull(rb.reader.File, segmentData); err != nil {
-				return fmt.Errorf("failed to read segment %d data: %w", i, err)
+				return fmt.Errorf("failed to read segment %d data %p: %w", i, fileSize, err)
 			}
 
 			// Write to output file at proper ELF offset
@@ -532,7 +551,7 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 			}
 		}
 	}
-	logInfo(cText("   + Copied all PT_LOAD segments"))
+	logger.Info("Copied all PT_LOAD segments")
 
 	// Write section data for sections we created (not in PT_LOAD segments)
 	// This is mainly .shstrtab
@@ -556,7 +575,7 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 			return fmt.Errorf("failed to write section %d: %w", i, err)
 		}
 
-		logDebug(cText("   + Wrote created section "), fValue(i), cText(" at "), fAddress(section.Offset))
+		logger.Debug("Wrote created section", "idx", i, "offset", fmt.Sprintf("0x%x", section.Offset))
 	}
 
 	// Write section header table
@@ -569,9 +588,9 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 			return fmt.Errorf("failed to write section header: %w", err)
 		}
 	}
-	logInfo(cText("   + Wrote section header table"))
+	logger.Info("Wrote section header table")
 
-	logInfo(cSuccess("✓ Successfully wrote rebuilt ELF file"))
+	logger.Info("✓ Successfully wrote rebuilt ELF file", "path", file.Name())
 
 	return nil
 }
