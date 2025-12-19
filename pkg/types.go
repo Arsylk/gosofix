@@ -95,6 +95,12 @@ const (
 	PT_GNU_RELRO    PT_Type = 0x6474e552
 )
 
+const (
+	PF_X = 1 // Execute
+	PF_W = 2 // Write
+	PF_R = 4 // Read
+)
+
 type SHT_Type uint32
 
 const (
@@ -119,41 +125,79 @@ const (
 type DT_Tag uint64
 
 const (
-	DT_NULL         DT_Tag = 0
-	DT_NEEDED       DT_Tag = 1
-	DT_PLTRELSZ     DT_Tag = 2
-	DT_PLTGOT       DT_Tag = 3
-	DT_HASH         DT_Tag = 4
-	DT_STRTAB       DT_Tag = 5
-	DT_SYMTAB       DT_Tag = 6
-	DT_RELA         DT_Tag = 7
-	DT_RELASZ       DT_Tag = 8
-	DT_RELAENT      DT_Tag = 9
-	DT_STRSZ        DT_Tag = 10
-	DT_SYMENT       DT_Tag = 11
-	DT_INIT         DT_Tag = 12
-	DT_FINIT        DT_Tag = 13
-	DT_SONAME       DT_Tag = 14
-	DT_RPATH        DT_Tag = 15
-	DT_SYMBOLIC     DT_Tag = 16
-	DT_REL          DT_Tag = 17
-	DT_RELSZ        DT_Tag = 18
-	DT_RELENT       DT_Tag = 19
-	DT_PLTREL       DT_Tag = 20
-	DT_JMPREL       DT_Tag = 23
-	DT_INIT_ARRAY   DT_Tag = 25
-	DT_FINI_ARRAY   DT_Tag = 26
-	DT_INIT_ARRAYSZ DT_Tag = 27
-	DT_FINI_ARRAYSZ DT_Tag = 28
-	DT_FLAGS        DT_Tag = 30
-	DT_GNU_HASH     DT_Tag = 0x6ffffef5
-	DT_VERSYM       DT_Tag = 0x6ffffff0
-	DT_RELACOUNT    DT_Tag = 0x6ffffff9
-	DT_RELCOUNT     DT_Tag = 0x6ffffffa
-	DT_FLAGS_1      DT_Tag = 0x6ffffffb
-	DT_VERNEED      DT_Tag = 0x6ffffffe
-	DT_VERNEEDNUM   DT_Tag = 0x6fffffff
+	DT_NULL            DT_Tag = 0
+	DT_NEEDED          DT_Tag = 1
+	DT_PLTRELSZ        DT_Tag = 2
+	DT_PLTGOT          DT_Tag = 3
+	DT_HASH            DT_Tag = 4
+	DT_STRTAB          DT_Tag = 5
+	DT_SYMTAB          DT_Tag = 6
+	DT_RELA            DT_Tag = 7
+	DT_RELASZ          DT_Tag = 8
+	DT_RELAENT         DT_Tag = 9
+	DT_STRSZ           DT_Tag = 10
+	DT_SYMENT          DT_Tag = 11
+	DT_INIT            DT_Tag = 12
+	DT_FINIT           DT_Tag = 13
+	DT_SONAME          DT_Tag = 14
+	DT_RPATH           DT_Tag = 15
+	DT_SYMBOLIC        DT_Tag = 16
+	DT_REL             DT_Tag = 17
+	DT_RELSZ           DT_Tag = 18
+	DT_RELENT          DT_Tag = 19
+	DT_PLTREL          DT_Tag = 20
+	DT_JMPREL          DT_Tag = 23
+	DT_PREINIT_ARRAY   DT_Tag = 32
+	DT_PREINIT_ARRAYSZ DT_Tag = 33
+	DT_INIT_ARRAY      DT_Tag = 25
+	DT_FINI_ARRAY      DT_Tag = 26
+	DT_INIT_ARRAYSZ    DT_Tag = 27
+	DT_FINI_ARRAYSZ    DT_Tag = 28
+	DT_RUNPATH         DT_Tag = 29
+	DT_FLAGS           DT_Tag = 30
+	DT_GNU_HASH        DT_Tag = 0x6ffffef5
+	DT_VERSYM          DT_Tag = 0x6ffffff0
+	DT_RELACOUNT       DT_Tag = 0x6ffffff9
+	DT_RELCOUNT        DT_Tag = 0x6ffffffa
+	DT_FLAGS_1         DT_Tag = 0x6ffffffb
+	DT_VERNEED         DT_Tag = 0x6ffffffe
+	DT_VERNEEDNUM      DT_Tag = 0x6fffffff
 )
+
+// Elf64_Verneed represents GNU symbol version requirements
+type Elf64_Verneed struct {
+	Version uint16
+	Cnt     uint16
+	File    uint32
+	Aux     uint32
+	Next    uint32
+}
+
+// Elf64_Vernaux represents auxiliary information for version requirements
+type Elf64_Vernaux struct {
+	Hash  uint32
+	Flags uint16
+	Other uint16
+	Name  uint32
+	Next  uint32
+}
+
+// Elf64_Verdef represents GNU symbol version definitions
+type Elf64_Verdef struct {
+	Version uint16
+	Flags   uint16
+	Nd      uint16
+	Cnt     uint16
+	Hash    uint32
+	Aux     uint32
+	Next    uint32
+}
+
+// Elf64_Verdaux represents auxiliary information for version definitions
+type Elf64_Verdaux struct {
+	Name uint32
+	Next uint32
+}
 
 func (p PT_Type) Text() string {
 	switch p {
@@ -181,7 +225,7 @@ func (p PT_Type) Text() string {
 	}
 }
 
-func (t SHT_Type) String() string {
+func (t SHT_Type) Text() string {
 	switch t {
 	case SHT_NULL:
 		return "SHT_NULL"
@@ -216,7 +260,7 @@ func (t SHT_Type) String() string {
 	case SHT_GNU_VERSYM:
 		return "SHT_GNU_VERSYM"
 	default:
-		return fmt.Sprintf("SHT_UNKNOWN(0x%x)", t)
+		return fmt.Sprintf("SHT_UNKNOWN(0x%x)", uint32(t))
 	}
 }
 
@@ -278,6 +322,10 @@ func (t DT_Tag) Text() string {
 		return "DT_RELCOUNT"
 	case DT_SYMBOLIC:
 		return "DT_SYMBOLIC"
+	case DT_PREINIT_ARRAY:
+		return "DT_PREINIT_ARRAY"
+	case DT_PREINIT_ARRAYSZ:
+		return "DT_PREINIT_ARRAYSZ"
 	default:
 		return fmt.Sprintf("DT_UNKNOWN(0x%x)", t)
 	}
@@ -417,4 +465,24 @@ func (r Elf64_Rela) Sym() uint32 {
 func PageStart(addr uint64) uint64 {
 	mask := ^(0x1000 - 1)
 	return addr & uint64(mask)
+}
+
+// AddrRange represents a range of virtual addresses occupied by a section
+type AddrRange struct {
+	Start uint64
+	End   uint64
+	Name  string
+}
+
+// ComputedSection holds metadata for sections discovered during analysis
+type ComputedSection struct {
+	Name      string
+	Type      SHT_Type
+	Flags     uint64
+	Addr      uint64
+	Size      uint64
+	Link      uint32
+	Info      uint32
+	Addralign uint64
+	Entsize   uint64
 }

@@ -12,13 +12,25 @@ import (
 
 func main() {
 	var debug bool
+	var verbose bool
+	var version bool
 	flag.BoolVar(&debug, "d", false, "Enable debug logging")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose output")
+	flag.BoolVar(&version, "version", false, "Show version information")
 	flag.Parse()
+
+	if version {
+		fmt.Println("SoFixer64 v1.0.0")
+		os.Exit(0)
+	}
 
 	args := flag.Args()
 
 	if len(args) < 2 {
-		fmt.Println("Usage: SoFixer64 [-d] <elf_file> <base_address> [output_file]")
+		fmt.Println("Usage: SoFixer64 [-d] [-v] <elf_file> <base_address> [output_file]")
+		fmt.Println("  -d        Enable debug logging")
+		fmt.Println("  -v        Enable verbose output")
+		fmt.Println("  --version Show version information")
 		os.Exit(1)
 	}
 
@@ -44,7 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = pkg.FixELFHeaders(filePath, baseAddr, outputPath, debug)
+	err = pkg.FixELFHeaders(filePath, baseAddr, outputPath, debug, verbose)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fixing ELF headers: %v\n", err)
 		os.Exit(1)
