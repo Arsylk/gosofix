@@ -122,6 +122,10 @@ type ElfReader struct {
 	ehFrameHdrOffset uint64
 	ehFrameHdrSize   uint64
 
+	// .eh_frame section (exception handling frame info)
+	ehFrameOffset uint64
+	ehFrameSize   uint64
+
 	// PT_NOTE (.note.gnu.build-id)
 	noteOffset uint64
 	noteSize   uint64
@@ -162,6 +166,11 @@ type ElfReader struct {
 	newStrtab    []byte
 	newSymbols   []Elf64_Sym
 
+	dtRelCount  uint64
+	dtRelaCount uint64
+
+	NoteSegments []AddrRange
+
 	BaseAddr uint64
 }
 
@@ -176,6 +185,9 @@ const (
 	SHF_ALLOC     = 0x2
 	SHF_EXECINSTR = 0x4
 	SHF_INFO_LINK = 0x40
+
+	ARM64_PLT0_SIZE      = 32
+	ARM64_PLT_ENTRY_SIZE = 16
 )
 
 // HashHeader represents the initial part of the DT_HASH table.
@@ -303,6 +315,11 @@ func (r *ElfReader) ReadPhdrs() error {
 	for i := range r.Phdrs {
 		phdr := &r.Phdrs[i]
 
+		// Normalize Vaddr if it appears absolute
+		if r.BaseAddr != 0 && phdr.Vaddr >= r.BaseAddr {
+			phdr.Vaddr -= r.BaseAddr
+		}
+
 		if phdr.Type == PT_LOAD && r.phdrPtLoadPageStart == 0 {
 			r.phdrPtLoadPageStart = PageStart(phdr.Vaddr)
 		}
@@ -314,11 +331,11 @@ func (r *ElfReader) ReadPhdrs() error {
 		}
 
 		if phdr.Type == PT_NOTE {
-			// We assume the first PT_NOTE is the build-id involved one, or at least one of them.
-			// Multiple PT_NOTEs might exist, but usually one segment covers them or they are contiguous.
-			// For simplicity, we capture the first non-zero one we see, or overwrite if we see multiple (usually just one major one in Android libs).
-			r.noteOffset = phdr.Vaddr
-			r.noteSize = phdr.Memsz
+			r.NoteSegments = append(r.NoteSegments, AddrRange{Start: phdr.Vaddr, End: phdr.Vaddr + phdr.Memsz, Name: ".note"})
+			if r.noteOffset == 0 {
+				r.noteOffset = phdr.Vaddr
+				r.noteSize = phdr.Memsz
+			}
 			logger.Info("Found PT_NOTE", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
 		}
 
@@ -455,6 +472,10 @@ func (r *ElfReader) ReadDyns() error {
 		case DT_SONAME:
 		case DT_RUNPATH:
 		case DT_NEEDED:
+		case DT_RELACOUNT:
+			r.dtRelaCount = val
+		case DT_RELCOUNT:
+			r.dtRelCount = val
 		}
 		logger.Debug("  + dynamic", "tag", entry.Tag.Text(), "val", val)
 		r.dynMap[entry.Tag] = val
@@ -519,8 +540,16 @@ func (r *ElfReader) collectOccupiedRanges() []AddrRange {
 	}
 	if r.ehFrameHdrOffset != 0 {
 		ranges = append(ranges, AddrRange{Start: r.ehFrameHdrOffset, End: r.ehFrameHdrOffset + r.ehFrameHdrSize, Name: ".eh_frame_hdr"})
+
+		// .eh_frame follows .eh_frame_hdr - calculate its precise size
+		r.calculateEhFrameSection()
+		if r.ehFrameOffset != 0 && r.ehFrameSize > 0 {
+			ranges = append(ranges, AddrRange{Start: r.ehFrameOffset, End: r.ehFrameOffset + r.ehFrameSize, Name: ".eh_frame"})
+		}
 	}
-	if r.noteOffset != 0 {
+	if len(r.NoteSegments) > 0 {
+		ranges = append(ranges, r.NoteSegments...)
+	} else if r.noteOffset != 0 {
 		ranges = append(ranges, AddrRange{Start: r.noteOffset, End: r.noteOffset + r.noteSize, Name: ".note.gnu.build-id"})
 	}
 	if r.relOffset != 0 {
@@ -559,7 +588,7 @@ func (r *ElfReader) findLargestGap(segStart, segEnd uint64, occupied []AddrRange
 	// Skip ELF headers if segment starts at 0
 	if current == 0 {
 		headerEnd := uint64(r.ElfHeader.Ehsize) + uint64(r.ElfHeader.Phnum)*uint64(r.ElfHeader.Phentsize)
-		headerEnd = (headerEnd + 15) &^ 15 // Align to 16 bytes
+		headerEnd = alignUp(headerEnd, 16)
 		current = headerEnd
 	}
 
@@ -601,7 +630,6 @@ func (r *ElfReader) findLargestGap(segStart, segEnd uint64, occupied []AddrRange
 }
 
 // calculateTextSection finds the largest executable gap to designate as .text
-// calculateTextSection finds the largest executable gap to designate as .text.
 // This method identifies unoccupied address ranges in executable segments and
 // designates the largest one as the .text section for reverse engineering purposes.
 func (r *ElfReader) calculateTextSection() {
@@ -622,8 +650,100 @@ func (r *ElfReader) calculateTextSection() {
 	if bestGapSize > 0 {
 		r.textAddr = bestGapStart
 		r.textSize = bestGapSize
-		logger.Info("Calculated .text section", "addr", fmt.Sprintf("0x%x", r.textAddr), "size", r.textSize)
+		logger.Info("[?] found .text section", "addr", fmt.Sprintf("0x%x", r.textAddr), "size", r.textSize)
 	}
+}
+
+// calculateEhFrameSection calculates the .eh_frame section location and precise size
+// It typically follows immediately after .eh_frame_hdr
+func (r *ElfReader) calculateEhFrameSection() {
+	if r.ehFrameHdrOffset == 0 || r.ehFrameOffset != 0 {
+		return // Already calculated or not available
+	}
+
+	// .eh_frame starts right after .eh_frame_hdr (aligned to 8 bytes)
+	ehFrameStart := alignUp(r.ehFrameHdrOffset+r.ehFrameHdrSize, 8)
+
+	// Parse the .eh_frame precisely
+	size, err := r.calculateEhFrameSize(ehFrameStart)
+	if err != nil {
+		logger.Warn("Failed to calculate precise .eh_frame size", "error", err)
+		return
+	}
+
+	if size > 0 {
+		r.ehFrameOffset = ehFrameStart
+		r.ehFrameSize = size
+		logger.Info("Calculated precise .eh_frame section", "addr", fmt.Sprintf("0x%x", r.ehFrameOffset), "size", r.ehFrameSize)
+	}
+}
+
+// calculateEhFrameSize parses the .eh_frame data to find its exact end
+func (r *ElfReader) calculateEhFrameSize(start uint64) (uint64, error) {
+	// Find file offset for the virtual address
+	fileOffset := uint64(0)
+	maxVaddr := uint64(0)
+	for _, phdr := range r.Phdrs {
+		if phdr.Type == PT_LOAD && start >= phdr.Vaddr && start < phdr.Vaddr+phdr.Memsz {
+			fileOffset = phdr.Offset + (start - phdr.Vaddr)
+			maxVaddr = phdr.Vaddr + phdr.Memsz
+			break
+		}
+	}
+
+	if fileOffset == 0 {
+		return 0, fmt.Errorf("could not find file offset for .eh_frame start at 0x%x", start)
+	}
+
+	currVaddr := start
+	currFileOffset := fileOffset
+
+	for {
+		// Ensure we don't go past segment boundary
+		if currVaddr+4 > maxVaddr {
+			break
+		}
+
+		// Read length (4 bytes)
+		var length uint32
+		if _, err := r.File.Seek(int64(currFileOffset), io.SeekStart); err != nil {
+			return 0, err
+		}
+		if err := binary.Read(r.File, binary.LittleEndian, &length); err != nil {
+			return 0, err
+		}
+
+		if length == 0 {
+			// End of .eh_frame entries
+			currVaddr += 4
+			currFileOffset += 4
+			break
+		}
+
+		entrySize := uint64(0)
+		if length == 0xffffffff {
+			// 64-bit DWARF
+			if currVaddr+12 > maxVaddr {
+				break
+			}
+			var length64 uint64
+			if err := binary.Read(r.File, binary.LittleEndian, &length64); err != nil {
+				return 0, err
+			}
+			entrySize = length64 + 12
+		} else {
+			entrySize = uint64(length) + 4
+		}
+
+		currVaddr += entrySize
+		currFileOffset += entrySize
+
+		if currVaddr >= maxVaddr {
+			break
+		}
+	}
+
+	return currVaddr - start, nil
 }
 
 // analyzeDataSections identifies all header-only sections (.dynamic, .got, .data, .bss, etc)
@@ -636,11 +756,34 @@ func (r *ElfReader) analyzeDataSections() {
 			Name: ".eh_frame_hdr", Type: SHT_PROGBITS, Flags: SHF_ALLOC,
 			Addr: r.ehFrameHdrOffset, Size: r.ehFrameHdrSize, Addralign: 4,
 		})
+
+		// .eh_frame typically follows .eh_frame_hdr
+		// Calculate its location by finding the next section boundary
+		r.calculateEhFrameSection()
 	}
-	if r.noteOffset != 0 && r.noteSize > 0 {
+	if len(r.NoteSegments) > 0 {
+		for i, ns := range r.NoteSegments {
+			name := ".note.gnu.build-id"
+			if i > 0 {
+				name = fmt.Sprintf(".note.%d", i)
+			}
+			r.computedSections = append(r.computedSections, ComputedSection{
+				Name: name, Type: SHT_NOTE, Flags: SHF_ALLOC,
+				Addr: ns.Start, Size: ns.End - ns.Start, Addralign: 4,
+			})
+		}
+	} else if r.noteOffset != 0 && r.noteSize > 0 {
 		r.computedSections = append(r.computedSections, ComputedSection{
 			Name: ".note.gnu.build-id", Type: SHT_NOTE, Flags: SHF_ALLOC,
 			Addr: r.noteOffset, Size: r.noteSize, Addralign: 4,
+		})
+	}
+
+	// Add .eh_frame if we calculated it
+	if r.ehFrameOffset != 0 && r.ehFrameSize > 0 {
+		r.computedSections = append(r.computedSections, ComputedSection{
+			Name: ".eh_frame", Type: SHT_PROGBITS, Flags: SHF_ALLOC,
+			Addr: r.ehFrameOffset, Size: r.ehFrameSize, Addralign: 8,
 		})
 	}
 
@@ -670,11 +813,12 @@ func (r *ElfReader) analyzeDataSections() {
 		})
 	}
 
-	// 2.5. Versioning sections
+	// 2.5. Versioning sections - Link field will be set later by rebuilder to point to .dynsym
 	if r.versymOffset != 0 && r.symCount > 0 {
 		r.computedSections = append(r.computedSections, ComputedSection{
 			Name: ".gnu.version", Type: SHT_GNU_VERSYM, Flags: SHF_ALLOC,
 			Addr: r.versymOffset, Size: r.symCount * 2, Addralign: 2, Entsize: 2,
+			// Link will be set to .dynsym index by rebuilder
 		})
 	}
 
@@ -692,13 +836,17 @@ func (r *ElfReader) analyzeDataSections() {
 		})
 	}
 
-	// 4. Data and BSS from segments
+	// 4. Collect all data and BSS ranges from writable segments, then merge into single sections
+	var dataRanges []AddrRange
+	var bssRanges []AddrRange
+
 	for _, phdr := range r.Phdrs {
 		if phdr.Type == PT_LOAD && (phdr.Flags&PF_W) != 0 {
-			// .data
+			// Collect .data range
 			if phdr.Filesz > 0 {
 				addr := phdr.Vaddr
 				size := phdr.Filesz
+				// Skip headers if this segment starts at 0
 				if addr == 0 {
 					headerSize := uint64(r.ElfHeader.Ehsize) + uint64(r.ElfHeader.Phnum)*uint64(r.ElfHeader.Phentsize)
 					headerSize = (headerSize + 15) &^ 15
@@ -706,20 +854,82 @@ func (r *ElfReader) analyzeDataSections() {
 					size -= headerSize
 				}
 				if size > 0 {
-					r.computedSections = append(r.computedSections, ComputedSection{
-						Name: ".data", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-						Addr: addr, Size: size, Addralign: 16,
-					})
+					dataRanges = append(dataRanges, AddrRange{Start: addr, End: addr + size, Name: ".data"})
 				}
 			}
-			// .bss
+			// Collect .bss range
 			if phdr.Memsz > phdr.Filesz {
-				r.computedSections = append(r.computedSections, ComputedSection{
-					Name: ".bss", Type: SHT_NOBITS, Flags: SHF_ALLOC | SHF_WRITE,
-					Addr: phdr.Vaddr + phdr.Filesz, Size: phdr.Memsz - phdr.Filesz, Addralign: 16,
-				})
+				bssAddr := phdr.Vaddr + phdr.Filesz
+				bssSize := phdr.Memsz - phdr.Filesz
+				bssRanges = append(bssRanges, AddrRange{Start: bssAddr, End: bssAddr + bssSize, Name: ".bss"})
 			}
 		}
+	}
+
+	// 5. Separate .data.rel.ro if PT_GNU_RELRO is present
+	if r.relroAddr != 0 && r.relroSize > 0 {
+		r.computedSections = append(r.computedSections, ComputedSection{
+			Name: ".data.rel.ro", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
+			Addr: r.relroAddr, Size: r.relroSize, Addralign: 16,
+		})
+
+		// Split dataRanges to exclude the RELRO part
+		var newDataRanges []AddrRange
+		for _, dr := range dataRanges {
+			// If RELRO is inside or overlaps with this range
+			if r.relroAddr >= dr.Start && r.relroAddr < dr.End {
+				// Part before RELRO
+				if r.relroAddr > dr.Start {
+					newDataRanges = append(newDataRanges, AddrRange{Start: dr.Start, End: r.relroAddr, Name: ".data"})
+				}
+				// Part after RELRO
+				relroEnd := r.relroAddr + r.relroSize
+				if relroEnd < dr.End {
+					newDataRanges = append(newDataRanges, AddrRange{Start: relroEnd, End: dr.End, Name: ".data"})
+				}
+			} else {
+				newDataRanges = append(newDataRanges, dr)
+			}
+		}
+		dataRanges = newDataRanges
+	}
+
+	// Merge and create single .data section
+	if len(dataRanges) > 0 {
+		minAddr := dataRanges[0].Start
+		maxEnd := dataRanges[0].End
+		for _, dataRange := range dataRanges {
+			if dataRange.Start < minAddr {
+				minAddr = dataRange.Start
+			}
+			if dataRange.End > maxEnd {
+				maxEnd = dataRange.End
+			}
+		}
+		r.computedSections = append(r.computedSections, ComputedSection{
+			Name: ".data", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
+			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
+		})
+		logger.Info("Merged .data section", "ranges", len(dataRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
+	}
+
+	// Merge and create single .bss section
+	if len(bssRanges) > 0 {
+		minAddr := bssRanges[0].Start
+		maxEnd := bssRanges[0].End
+		for _, bssRange := range bssRanges {
+			if bssRange.Start < minAddr {
+				minAddr = bssRange.Start
+			}
+			if bssRange.End > maxEnd {
+				maxEnd = bssRange.End
+			}
+		}
+		r.computedSections = append(r.computedSections, ComputedSection{
+			Name: ".bss", Type: SHT_NOBITS, Flags: SHF_ALLOC | SHF_WRITE,
+			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
+		})
+		logger.Info("Merged .bss section", "ranges", len(bssRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
 	}
 }
 
@@ -815,7 +1025,7 @@ func (r *ElfReader) calculatePltInfo() {
 	}
 
 	pltCount := r.jmprelSize / r.jmprelEntry
-	r.pltSize = 32 + (pltCount * 16) // 32-byte header + 16 bytes per entry
+	r.pltSize = ARM64_PLT0_SIZE + (pltCount * ARM64_PLT_ENTRY_SIZE)
 
 	// PLT usually follows .rela.plt immediately (16-byte aligned)
 	estimatedPltAddr := alignUp(r.jmprelOffset+r.jmprelSize, 16)
@@ -948,6 +1158,17 @@ func (r *ElfReader) buildPopulatedStrtab() error {
 	// Add null symbol
 	r.newSymbols = append(r.newSymbols, Elf64_Sym{})
 
+	// Add library names (DT_NEEDED, DT_SONAME, DT_RUNPATH) to strtab
+	for _, lib := range r.neededLibs {
+		r.addStringToStrtab(lib)
+	}
+	if r.soname != "" {
+		r.addStringToStrtab(r.soname)
+	}
+	if r.runpath != "" {
+		r.addStringToStrtab(r.runpath)
+	}
+
 	// Process all symbols
 	localSymbols, globalSymbols := r.processSymbols()
 
@@ -955,7 +1176,7 @@ func (r *ElfReader) buildPopulatedStrtab() error {
 	r.newSymbols = append(r.newSymbols, localSymbols...)
 	r.newSymbols = append(r.newSymbols, globalSymbols...)
 
-	logger.Info("Built string table", "size", len(r.newStrtab), "null", 1, "local", len(localSymbols), "global", len(globalSymbols))
+	logger.Info("Built string table", "size", len(r.newStrtab), "null", 1, "local", len(localSymbols), "global", len(globalSymbols), "libs", len(r.neededLibs))
 	return nil
 }
 
@@ -971,7 +1192,7 @@ func (r *ElfReader) processSymbols() ([]Elf64_Sym, []Elf64_Sym) {
 		}
 
 		// Skip empty/null entries
-		if r.isEmptySymbol(sym) {
+		if sym.IsEmptySymbol() {
 			continue
 		}
 
@@ -991,11 +1212,6 @@ func (r *ElfReader) processSymbols() ([]Elf64_Sym, []Elf64_Sym) {
 	}
 
 	return localSymbols, globalSymbols
-}
-
-// isEmptySymbol checks if a symbol is empty/null
-func (r *ElfReader) isEmptySymbol(sym Elf64_Sym) bool {
-	return sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0
 }
 
 // addStringToStrtab adds a string to the new string table and returns its offset
@@ -1075,57 +1291,46 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 		}
 
 		// 4. Find max symbol index
-		maxSymIndex := uint64(header.Symndx)
-
-		// Seek to chains start
-		if _, err := file.Seek(int64(chainsOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("failed to seek to GNU hash chains: %w", err)
-		}
-
-		// Read all chain data at once (more efficient)
-		maxChainSize := 100000 * 4 // 400KB buffer
-		chainBuf := make([]byte, maxChainSize)
-		n, err := file.Read(chainBuf)
-		if err != nil && err != io.EOF {
-			return 0, fmt.Errorf("failed to read GNU hash chains: %w", err)
-		}
-		chainBuf = chainBuf[:n]
-
-		chainCache := make(map[uint32]bool)
-
-		for _, bucketIndex := range buckets {
-			if bucketIndex < header.Symndx || bucketIndex == 0 {
-				continue
-			}
-
-			if chainCache[bucketIndex] {
-				continue
-			}
-
-			chainCache[bucketIndex] = true
-			currentSymIndex := uint64(bucketIndex)
-
-			for {
-				chainIndex := currentSymIndex - uint64(header.Symndx)
-				byteOffset := chainIndex * 4
-
-				if byteOffset+4 > uint64(len(chainBuf)) {
-					break
-				}
-
-				if currentSymIndex > maxSymIndex {
-					maxSymIndex = currentSymIndex
-				}
-
-				chainVal := binary.LittleEndian.Uint32(chainBuf[byteOffset : byteOffset+4])
-				if chainVal&1 != 0 {
-					break
-				}
-				currentSymIndex++
+		// Symbols are sorted by hash bucket. The highest symbol index is in the chain
+		// of the non-empty bucket with the highest starting index.
+		maxBucketIndex := uint32(0)
+		for _, bptr := range buckets {
+			if bptr > maxBucketIndex {
+				maxBucketIndex = bptr
 			}
 		}
 
-		return maxSymIndex + 1, nil
+		if maxBucketIndex == 0 {
+			// All buckets are empty
+			return uint64(header.Symndx), nil
+		}
+
+		// Follow the chain starting at maxBucketIndex
+		currentSymIndex := uint64(maxBucketIndex)
+		for {
+			chainIndex := currentSymIndex - uint64(header.Symndx)
+			if _, err := file.Seek(int64(chainsOffset+chainIndex*4), io.SeekStart); err != nil {
+				return currentSymIndex, nil
+			}
+
+			var chainVal uint32
+			if err := binary.Read(file, binary.LittleEndian, &chainVal); err != nil {
+				return currentSymIndex, nil
+			}
+
+			// Bit 0 = 1 marks the end of the chain (last entry for this hash bucket)
+			if (chainVal & 1) != 0 {
+				return currentSymIndex + 1, nil
+			}
+			currentSymIndex++
+
+			// Guard against infinite loop
+			if currentSymIndex > 1000000 {
+				break
+			}
+		}
+
+		return currentSymIndex + 1, nil
 	}
 
 	return 0, fmt.Errorf("missing DT_HASH or DT_GNU_HASH or DT_SYMTAB/DT_SYMENT")

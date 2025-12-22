@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 )
 
 // ElfRebuilder handles the reconstruction of a valid ELF file from Android memory dumps.
@@ -55,6 +56,7 @@ type ElfRebuilder struct {
 	initArraySectionIdx  int
 	finiArraySectionIdx  int
 	ehFrameHdrSectionIdx int
+	ehFrameSectionIdx    int
 	noteSectionIdx       int
 	pltSectionIdx        int
 	textSectionIdx       int
@@ -90,6 +92,39 @@ func (rb *ElfRebuilder) addShstrtabString(s string) uint32 {
 	rb.shstrtab = append(rb.shstrtab, 0)
 	rb.shstrtabMap[s] = offset
 	return offset
+}
+
+// rebuildDynamicSection creates a new dynamic section with corrected STRTAB offsets
+func (rb *ElfRebuilder) rebuildDynamicSection() []byte {
+	var newDyns []Elf64_Dyn
+
+	for _, dyn := range rb.reader.Dyns {
+		newDyn := dyn
+
+		// For string-referencing tags, resolve the old string and get new offset
+		switch dyn.Tag {
+		case DT_NEEDED, DT_SONAME, DT_RUNPATH:
+			logger.Debug("Processing string-ref tag", "tag", dyn.Tag.Text(), "old_val", fmt.Sprintf("0x%x", dyn.Val))
+			// Read string from original strtab using old offset
+			oldStr := rb.reader.readString(uint32(dyn.Val))
+			logger.Debug("Read string from strtab", "tag", dyn.Tag.Text(), "offset", dyn.Val, "str", oldStr)
+			if oldStr != "" {
+				// Find the new offset in rebuilt strtab
+				if newOffset, ok := rb.reader.newStrtabMap[oldStr]; ok {
+					newDyn.Val = uint64(newOffset)
+					logger.Debug("Updated dynamic entry", "tag", dyn.Tag.Text(), "str", oldStr, "old_offset", dyn.Val, "new_offset", newOffset)
+				} else {
+					logger.Warn("Dynamic string not found in new strtab", "tag", dyn.Tag.Text(), "str", oldStr, "strtabSize", len(rb.reader.newStrtabMap))
+				}
+			} else {
+				logger.Warn("Failed to read string", "tag", dyn.Tag.Text(), "offset", dyn.Val)
+			}
+		}
+
+		newDyns = append(newDyns, newDyn)
+	}
+
+	return makeBytes(newDyns)
 }
 
 // vaddrToOffset converts a virtual address to a file offset using PT_LOAD segments
@@ -339,6 +374,25 @@ func (rb *ElfRebuilder) addRelocationSections() {
 func (rb *ElfRebuilder) addComputedSections() {
 	for _, cs := range rb.reader.computedSections {
 		link := cs.Link
+
+		// Special handling for .dynamic section - rebuild it with corrected string offsets
+		if cs.Name == ".dynamic" {
+			link = uint32(rb.dynstrSectionIdx)
+			// Rebuild the dynamic section with corrected offsets
+			dynamicData := rb.rebuildDynamicSection()
+			rb.dynamicSectionIdx = rb.addSection(
+				cs.Name, cs.Type, cs.Flags, cs.Addr,
+				dynamicData, link, cs.Info, cs.Addralign, cs.Entsize,
+			)
+			logger.Info("Added rebuilt .dynamic section", "addr", fmt.Sprintf("0x%x", cs.Addr), "size", len(dynamicData))
+			continue
+		}
+
+		// Set link for .gnu.version to point to .dynsym
+		if cs.Name == ".gnu.version" {
+			link = uint32(rb.dynsymSectionIdx)
+		}
+
 		if cs.Name == ".dynamic" && link == 0 {
 			link = uint32(rb.dynstrSectionIdx)
 		}
@@ -356,22 +410,21 @@ func (rb *ElfRebuilder) addComputedSections() {
 		)
 
 		// Map indices back for potential linkage
-		switch cs.Name {
-		case ".plt":
+		if cs.Name == ".plt" {
 			rb.pltSectionIdx = idx
-		case ".dynamic":
-			rb.dynamicSectionIdx = idx
-		case ".got":
+		} else if cs.Name == ".got" {
 			rb.gotSectionIdx = idx
-		case ".init_array":
+		} else if cs.Name == ".init_array" {
 			rb.initArraySectionIdx = idx
-		case ".fini_array":
+		} else if cs.Name == ".fini_array" {
 			rb.finiArraySectionIdx = idx
-		case ".eh_frame_hdr":
+		} else if cs.Name == ".eh_frame_hdr" {
 			rb.ehFrameHdrSectionIdx = idx
-		case ".note.gnu.build-id":
+		} else if cs.Name == ".eh_frame" {
+			rb.ehFrameSectionIdx = idx
+		} else if cs.Name == ".note.gnu.build-id" || (rb.noteSectionIdx == 0 && cs.Type == SHT_NOTE) {
 			rb.noteSectionIdx = idx
-		case ".text":
+		} else if cs.Name == ".text" {
 			rb.textSectionIdx = idx
 		}
 		logger.Info("Added computed section", "name", cs.Name, "addr", fmt.Sprintf("0x%x", cs.Addr), "size", cs.Size)
@@ -520,6 +573,47 @@ func makeBytes[T any](data []T) []byte {
 	return buf.Bytes()
 }
 
+// detectSectionOverlaps checks for overlapping sections and logs warnings
+func (rb *ElfRebuilder) detectSectionOverlaps() {
+	type sectionRange struct {
+		idx   int
+		name  string
+		start uint64
+		end   uint64
+	}
+
+	var ranges []sectionRange
+	for i, sec := range rb.sections {
+		if sec.Type == SHT_NULL || sec.Type == SHT_NOBITS || sec.Size == 0 {
+			continue
+		}
+		ranges = append(ranges, sectionRange{
+			idx:   i,
+			name:  rb.sectionNames[i],
+			start: sec.Offset,
+			end:   sec.Offset + sec.Size,
+		})
+	}
+
+	// Sort by start offset
+	sort.Slice(ranges, func(i, j int) bool {
+		return ranges[i].start < ranges[j].start
+	})
+
+	// Check for overlaps
+	for i := 0; i < len(ranges)-1; i++ {
+		if ranges[i].end > ranges[i+1].start {
+			logger.Warn("Section overlap detected",
+				"section1", ranges[i].name,
+				"range1", fmt.Sprintf("0x%x-0x%x", ranges[i].start, ranges[i].end),
+				"section2", ranges[i+1].name,
+				"range2", fmt.Sprintf("0x%x-0x%x", ranges[i+1].start, ranges[i+1].end),
+				"overlap", ranges[i].end-ranges[i+1].start,
+			)
+		}
+	}
+}
+
 // calculateLayout determines file offsets for all sections.
 // For memory dumps, most sections already have their offsets set from vaddrToOffset.
 // This method assigns offsets to newly created sections (like .shstrtab) and
@@ -544,6 +638,9 @@ func (rb *ElfRebuilder) calculateLayout() error {
 
 	logger.Info("Section header table", "offset", fmt.Sprintf("0x%x", rb.currentOffset))
 	logger.Info("Total file size", "bytes", rb.currentOffset+uint64(len(rb.sections))*64)
+
+	// Step 5: Detect section overlaps (warning only, don't fail)
+	rb.detectSectionOverlaps()
 
 	return nil
 }
@@ -650,18 +747,18 @@ func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
 			// Read from memory dump
 			segmentData := make([]byte, copySize)
 			if _, err := rb.reader.File.Seek(int64(srcOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek to segment %d in source: %w", i, err)
+				return fmt.Errorf("failed to seek to source offset 0x%x for segment %d: %w", srcOffset, i, err)
 			}
 			if _, err := io.ReadFull(rb.reader.File, segmentData); err != nil {
-				return fmt.Errorf("failed to read segment %d data: %w", i, err)
+				return fmt.Errorf("failed to read %d bytes for segment %d from source: %w", copySize, i, err)
 			}
 
 			// Write to output ELF at proper offset
 			if _, err := file.Seek(int64(dstOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek to segment %d in output: %w", i, err)
+				return fmt.Errorf("failed to seek to output offset 0x%x for segment %d: %w", dstOffset, i, err)
 			}
 			if _, err := file.Write(segmentData); err != nil {
-				return fmt.Errorf("failed to write segment %d data: %w", i, err)
+				return fmt.Errorf("failed to write %d bytes for segment %d to output: %w", copySize, i, err)
 			}
 		}
 	}

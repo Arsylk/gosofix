@@ -101,6 +101,10 @@ const (
 	PF_R = 4 // Read
 )
 
+func (sym Elf64_Sym) IsEmptySymbol() bool {
+	return sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0
+}
+
 type SHT_Type uint32
 
 const (
