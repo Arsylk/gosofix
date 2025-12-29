@@ -19,28 +19,29 @@ var (
 )
 
 func init() {
-	// Create custom styles for the logger
+	// Create custom styles for the logger - minimalist machine-like format
 	styles := log.DefaultStyles()
 
-	// Catppuccin Mocha inspired colors for log levels
+	// Symbolic prefixes with strict color coding
 	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
-		SetString("DEBG").
-		Foreground(lipgloss.Color("243")) // Grey
+		SetString("[?]").
+		Foreground(lipgloss.Color("243")) // grey - trace/debug
 	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().
-		SetString("INFO").
-		Foreground(lipgloss.Color("86")) // Cyan
+		SetString("[+]").
+		Foreground(lipgloss.Color("86")) // cyan - success/info
 	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().
-		SetString("WARN").
-		Foreground(lipgloss.Color("221")) // Yellow
+		SetString("[!]").
+		Foreground(lipgloss.Color("221")) // yellow - warning
 	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
-		SetString("ERROR").
-		Foreground(lipgloss.Color("#f38ba8")) // Red
+		SetString("[x]").
+		Foreground(lipgloss.Color("#f38ba8")) // red - error
 
 	// Style for keys and values
 	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe"))
 
-	for _, key := range []string{"vaddr", "addr", "offset", "base", "from", "to", "end", "final_va", "maxSegmentEnd"} {
+	// Address values get orange highlight
+	for _, key := range []string{"vaddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Transform(func(s string) string {
 			if num, err := strconv.Atoi(s); err == nil {
 				return fmt.Sprintf("0x%x", num)
@@ -48,13 +49,16 @@ func init() {
 			return s
 		})
 	}
+	// Type tags get blue bold
 	for _, key := range []string{"type", "tag", "reloc", "bind"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
 	}
+	// File paths get yellow
 	for _, key := range []string{"file", "path"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
 	}
-	for _, key := range []string{"name"} {
+	// Names get green
+	for _, key := range []string{"name", "sym", "lib", "section", "section1", "section2"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	}
 
@@ -221,7 +225,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bo
 	} else {
 		logger.SetLevel(log.WarnLevel)
 	}
-	logger.Info("Starting ELF fix", "file", filePath, "base", baseAddr)
+	logger.Info("elf:fix", "file", filePath, "base", baseAddr)
 
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
@@ -273,7 +277,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bo
 }
 
 func (r *ElfReader) ReadElfHeaders() error {
-	logger.Info("Reading and validating ELF header")
+	logger.Info("elf:header | reading")
 	if err := binary.Read(r.File, binary.LittleEndian, r.ElfHeader); err != nil {
 		return fmt.Errorf("failed to read ELF header: %w", err)
 	}
@@ -292,7 +296,7 @@ func (r *ElfReader) ReadElfHeaders() error {
 	if r.ElfHeader.Type != ET_DYN {
 		return fmt.Errorf("unsupported ELF type: %d (expected shared object/3)", r.ElfHeader.Type)
 	}
-	logger.Info("ELF header validated", "class", "64-bit", "arch", "AArch64", "type", "shared object", "phentsize", r.ElfHeader.Phentsize)
+	logger.Info("elf:header | valid", "class", "64-bit", "arch", "aarch64", "type", "shared object", "phentsize", r.ElfHeader.Phentsize)
 
 	return nil
 }
@@ -305,7 +309,7 @@ func (r *ElfReader) ReadPhdrs() error {
 	if r.ElfHeader.Phnum > 1024 {
 		return fmt.Errorf("too many program headers: %d (max 1024)", r.ElfHeader.Phnum)
 	}
-	logger.Info("Reading PHT", "offset", r.ElfHeader.PhdrOffset, "entries", r.ElfHeader.Phnum)
+	logger.Info("pht:read", "offset", r.ElfHeader.PhdrOffset, "entries", r.ElfHeader.Phnum)
 
 	var err error
 	if r.Phdrs, err = readArray[Elf64_Phdr](r.File, r.ElfHeader.PhdrOffset, uint64(r.ElfHeader.Phnum), "PT_PHDR"); err != nil {
@@ -327,7 +331,7 @@ func (r *ElfReader) ReadPhdrs() error {
 		if phdr.Type == PT_GNU_EH_FRAME {
 			r.ehFrameHdrOffset = phdr.Vaddr
 			r.ehFrameHdrSize = phdr.Memsz
-			logger.Info("Found PT_GNU_EH_FRAME", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
+			logger.Info("phdr | eh_frame", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
 		}
 
 		if phdr.Type == PT_NOTE {
@@ -336,19 +340,19 @@ func (r *ElfReader) ReadPhdrs() error {
 				r.noteOffset = phdr.Vaddr
 				r.noteSize = phdr.Memsz
 			}
-			logger.Info("Found PT_NOTE", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
+			logger.Info("phdr | note", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
 		}
 
 		if phdr.Type == PT_TLS {
 			r.tlsOffset = phdr.Vaddr
 			r.tlsSize = phdr.Memsz
-			logger.Info("Found PT_TLS", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
+			logger.Info("phdr | tls", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
 		}
 
 		if phdr.Type == PT_GNU_RELRO {
 			r.relroAddr = phdr.Vaddr
 			r.relroSize = phdr.Memsz
-			logger.Info("Found PT_GNU_RELRO", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
+			logger.Info("phdr | relro", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
 		}
 
 		logger.Debug("  + header", "type", phdr.Type.Text(), "offset", phdr.Offset)
@@ -375,17 +379,17 @@ func (r *ElfReader) ReadDyns() error {
 	}
 
 	if dynamicPhdr == nil {
-		logger.Warn("No dynamic section found")
+		logger.Warn("dyn:missing")
 		return nil
 	}
 
 	entryCount := dynamicPhdr.Memsz / uint64(binary.Size(Elf64_Dyn{}))
-	logger.Info("Reading DYN", "offset", dynamicPhdr.Offset, "entries", entryCount)
+	logger.Info("dyn:read", "offset", dynamicPhdr.Offset, "entries", entryCount)
 
 	if entryCount == 0 {
 		return fmt.Errorf("dynamic section has zero size")
 	}
-	logger.Debug("Dynamic section found", "vaddr", dynamicPhdr.Vaddr, "offset", dynamicPhdr.Offset, "entries", entryCount)
+	logger.Debug("dyn:found", "vaddr", dynamicPhdr.Vaddr, "offset", dynamicPhdr.Offset, "entries", entryCount)
 
 	// Store dynamic section info
 	r.dynamicOffset = dynamicPhdr.Vaddr
@@ -650,7 +654,7 @@ func (r *ElfReader) calculateTextSection() {
 	if bestGapSize > 0 {
 		r.textAddr = bestGapStart
 		r.textSize = bestGapSize
-		logger.Info("[?] found .text section", "addr", fmt.Sprintf("0x%x", r.textAddr), "size", r.textSize)
+		logger.Info("section | .text", "addr", fmt.Sprintf("0x%x", r.textAddr), "size", r.textSize)
 	}
 }
 
@@ -667,14 +671,14 @@ func (r *ElfReader) calculateEhFrameSection() {
 	// Parse the .eh_frame precisely
 	size, err := r.calculateEhFrameSize(ehFrameStart)
 	if err != nil {
-		logger.Warn("Failed to calculate precise .eh_frame size", "error", err)
+		logger.Warn("eh_frame:size | calc failed", "error", err)
 		return
 	}
 
 	if size > 0 {
 		r.ehFrameOffset = ehFrameStart
 		r.ehFrameSize = size
-		logger.Info("Calculated precise .eh_frame section", "addr", fmt.Sprintf("0x%x", r.ehFrameOffset), "size", r.ehFrameSize)
+		logger.Info("section | .eh_frame", "addr", fmt.Sprintf("0x%x", r.ehFrameOffset), "size", r.ehFrameSize)
 	}
 }
 
@@ -861,17 +865,51 @@ func (r *ElfReader) analyzeDataSections() {
 			if phdr.Memsz > phdr.Filesz {
 				bssAddr := phdr.Vaddr + phdr.Filesz
 				bssSize := phdr.Memsz - phdr.Filesz
-				bssRanges = append(bssRanges, AddrRange{Start: bssAddr, End: bssAddr + bssSize, Name: ".bss"})
+				bssRanges = append(bssRanges, AddrRange{Start: bssAddr, End: bssAddr + bssSize, Name: ".bss.ram"})
 			}
 		}
 	}
 
 	// 5. Separate .data.rel.ro if PT_GNU_RELRO is present
 	if r.relroAddr != 0 && r.relroSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".data.rel.ro", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: r.relroAddr, Size: r.relroSize, Addralign: 16,
-		})
+		relroRanges := []AddrRange{{Start: r.relroAddr, End: r.relroAddr + r.relroSize, Name: ".data.rel.ro"}}
+
+		// Identify sections that fall within RELRO
+		var inRelro []AddrRange
+		for _, cs := range r.computedSections {
+			if cs.Addr >= r.relroAddr && cs.Addr+cs.Size <= r.relroAddr+r.relroSize {
+				inRelro = append(inRelro, AddrRange{Start: cs.Addr, End: cs.Addr + cs.Size, Name: cs.Name})
+			}
+		}
+
+		// Subtract these sections from RELRO range to find purely RELRO areas
+		if len(inRelro) > 0 {
+			sort.Slice(inRelro, func(i, j int) bool { return inRelro[i].Start < inRelro[j].Start })
+
+			var finalRelro []AddrRange
+			curr := r.relroAddr
+			for _, ir := range inRelro {
+				if ir.Start > curr {
+					finalRelro = append(finalRelro, AddrRange{Start: curr, End: ir.Start, Name: ".data.rel.ro"})
+				}
+				curr = ir.End
+			}
+			if curr < r.relroAddr+r.relroSize {
+				finalRelro = append(finalRelro, AddrRange{Start: curr, End: r.relroAddr + r.relroSize, Name: ".data.rel.ro"})
+			}
+			relroRanges = finalRelro
+		}
+
+		for i, rr := range relroRanges {
+			name := ".data.rel.ro"
+			if i > 0 {
+				name = fmt.Sprintf(".data.rel.ro.%d", i)
+			}
+			r.computedSections = append(r.computedSections, ComputedSection{
+				Name: name, Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
+				Addr: rr.Start, Size: rr.End - rr.Start, Addralign: 16,
+			})
+		}
 
 		// Split dataRanges to exclude the RELRO part
 		var newDataRanges []AddrRange
@@ -910,7 +948,7 @@ func (r *ElfReader) analyzeDataSections() {
 			Name: ".data", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
 			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
 		})
-		logger.Info("Merged .data section", "ranges", len(dataRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
+		logger.Info("section | .data (merged)", "ranges", len(dataRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
 	}
 
 	// Merge and create single .bss section
@@ -926,10 +964,10 @@ func (r *ElfReader) analyzeDataSections() {
 			}
 		}
 		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".bss", Type: SHT_NOBITS, Flags: SHF_ALLOC | SHF_WRITE,
+			Name: ".bss.ram", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
 			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
 		})
-		logger.Info("Merged .bss section", "ranges", len(bssRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
+		logger.Info("section | .bss.ram (merged)", "ranges", len(bssRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
 	}
 }
 
@@ -941,11 +979,11 @@ func (r *ElfReader) readSymbols() error {
 	}
 
 	if r.symCount == 0 {
-		logger.Warn("No symbols found")
+		logger.Warn("sym:none")
 		return nil
 	}
 
-	logger.Info("Found symbols", "count", r.symCount)
+	logger.Info("sym:count", "count", r.symCount)
 	if r.Symbols, err = readArray[Elf64_Sym](r.File, r.symtabOffset, r.symCount, "DT_SYMTAB"); err != nil {
 		return fmt.Errorf("failed to read symbols: %w", err)
 	}
@@ -959,7 +997,7 @@ func (r *ElfReader) readRelocationTables() error {
 
 	if r.relOffset != 0 {
 		relCount := r.relSize / uint64(binary.Size(Elf64_Rel{}))
-		logger.Info("Reading DT_REL", "offset", r.relOffset, "count", relCount)
+		logger.Info("rel:read", "offset", r.relOffset, "count", relCount)
 		if r.Rel, err = readArray[Elf64_Rel](r.File, r.relOffset, relCount, "DT_REL"); err != nil {
 			return err
 		}
@@ -967,7 +1005,7 @@ func (r *ElfReader) readRelocationTables() error {
 
 	if r.relaOffset != 0 {
 		relaCount := r.relaSize / uint64(binary.Size(Elf64_Rela{}))
-		logger.Info("Reading DT_RELA", "offset", r.relaOffset, "count", relaCount)
+		logger.Info("rela:read", "offset", r.relaOffset, "count", relaCount)
 		if r.Rela, err = readArray[Elf64_Rela](r.File, r.relaOffset, relaCount, "DT_RELA"); err != nil {
 			return err
 		}
@@ -976,13 +1014,13 @@ func (r *ElfReader) readRelocationTables() error {
 	if r.jmprelOffset != 0 {
 		if r.jmprelEntry == 16 {
 			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rel{}))
-			logger.Info("Reading DT_JMPREL", "offset", r.jmprelOffset, "count", jmprelCount, "type", "REL")
+			logger.Info("jmprel:read", "offset", r.jmprelOffset, "count", jmprelCount, "type", "REL")
 			if r.JmpRel, err = readArray[Elf64_Rel](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
 			}
 		} else {
 			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rela{}))
-			logger.Info("Reading DT_JMPREL", "offset", r.jmprelOffset, "count", jmprelCount, "type", "RELA")
+			logger.Info("jmprel:read", "offset", r.jmprelOffset, "count", jmprelCount, "type", "RELA")
 			if r.JmpRela, err = readArray[Elf64_Rela](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
 			}
@@ -1035,24 +1073,24 @@ func (r *ElfReader) calculatePltInfo() {
 		if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 {
 			if estimatedPltAddr >= phdr.Vaddr && estimatedPltAddr < phdr.Vaddr+phdr.Memsz {
 				r.pltAddr = estimatedPltAddr
-				logger.Info("Calculated PLT", "addr", fmt.Sprintf("0x%x", r.pltAddr), "size", r.pltSize)
+				logger.Info("section | .plt", "addr", fmt.Sprintf("0x%x", r.pltAddr), "size", r.pltSize)
 				return
 			}
 		}
 	}
 
-	logger.Warn("Could not determine PLT address safely")
+	logger.Warn("plt:addr | unknown")
 }
 
 func (r *ElfReader) FixRelocs(base uint64) error {
-	logger.Info("Fixing relocations", "base", base)
+	logger.Info("reloc:fix", "base", base)
 
 	r.fixRelArray(r.Rel, base)
 	r.fixRelaArray(r.Rela, base)
 	r.fixRelArray(r.JmpRel, base)
 	r.fixRelaArray(r.JmpRela, base)
 
-	logger.Info("Relocations fixed", "rel", len(r.Rel), "rela", len(r.Rela), "jmprel", len(r.JmpRel), "jmprela", len(r.JmpRela))
+	logger.Info("reloc:done", "rel", len(r.Rel), "rela", len(r.Rela), "jmprel", len(r.JmpRel), "jmprela", len(r.JmpRela))
 	return nil
 }
 
@@ -1095,7 +1133,7 @@ func (r *ElfReader) fixSingleRel(rel *Elf64_Rel, base uint64) {
 	}
 
 	rel.Offset = P
-	logger.Debug("Fixed REL", "type", relocType.Text(), "sym", rname, "final_va", P)
+	logger.Debug("rel:fixed", "type", relocType.Text(), "sym", rname, "final_va", P)
 }
 
 // fixSingleRela fixes a single RELA relocation entry
@@ -1126,12 +1164,12 @@ func (r *ElfReader) fixSingleRela(rela *Elf64_Rela, base uint64) {
 	}
 
 	rela.Offset = P
-	logger.Debug("Fixed RELA", "type", relocType.Text(), "sym", rname, "final_va", P)
+	logger.Debug("rela:fixed", "type", relocType.Text(), "sym", rname, "final_va", P)
 }
 
 // BuildStrtab builds a new string table with all symbol names
 func (r *ElfReader) BuildStrtab() error {
-	logger.Info("Building new string table")
+	logger.Info("strtab:build")
 
 	if len(r.Symbols) == 0 {
 		return r.buildEmptyStrtab()
@@ -1142,7 +1180,7 @@ func (r *ElfReader) BuildStrtab() error {
 
 // buildEmptyStrtab handles the case with no symbols
 func (r *ElfReader) buildEmptyStrtab() error {
-	logger.Warn("No symbols to process, building minimal string table")
+	logger.Warn("strtab:empty | minimal")
 	r.newStrtab = []byte{0}
 	r.newStrtabMap = make(map[string]uint32)
 	r.newSymbols = []Elf64_Sym{{}} // Just null symbol
@@ -1176,7 +1214,7 @@ func (r *ElfReader) buildPopulatedStrtab() error {
 	r.newSymbols = append(r.newSymbols, localSymbols...)
 	r.newSymbols = append(r.newSymbols, globalSymbols...)
 
-	logger.Info("Built string table", "size", len(r.newStrtab), "null", 1, "local", len(localSymbols), "global", len(globalSymbols), "libs", len(r.neededLibs))
+	logger.Info("strtab:done", "size", len(r.newStrtab), "null", 1, "local", len(localSymbols), "global", len(globalSymbols), "libs", len(r.neededLibs))
 	return nil
 }
 
@@ -1198,7 +1236,7 @@ func (r *ElfReader) processSymbols() ([]Elf64_Sym, []Elf64_Sym) {
 
 		// Read original symbol name
 		symName := readStrtabString(r.File, r.strtabOffset, sym.St_Name)
-		logger.Debug("Processing symbol", "idx", i, "name", symName, "value", sym.St_Value, "bind", sym.stBind().Text(), "type", sym.stType())
+		logger.Debug("sym:process", "idx", i, "name", symName, "value", sym.St_Value, "bind", sym.stBind().Text(), "type", sym.stType())
 
 		// Update name offset in new strtab
 		sym.St_Name = r.addStringToStrtab(symName)
@@ -1252,7 +1290,7 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 
 	if hashOffset != 0 {
 		var header HashHeader
-		logger.Info("Using DT_HASH for symbol count")
+		logger.Info("sym:count | via hash")
 
 		if _, err := file.Seek(int64(hashOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("failed to seek to hash table: %w", err)
@@ -1267,7 +1305,7 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 	if gnuHashOffset != 0 {
 		// 1. Read GNU Hash Header
 		var header GNUHashHeader
-		logger.Info("Using DT_GNU_HASH for symbol count")
+		logger.Info("sym:count | via gnu_hash")
 
 		if _, err := file.Seek(int64(gnuHashOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("failed to seek to GNU hash table: %w", err)
@@ -1478,14 +1516,14 @@ func (r *ElfReader) ResolveMetadata() {
 			lib := r.readString(uint32(entry.Val))
 			if lib != "" {
 				r.neededLibs = append(r.neededLibs, lib)
-				logger.Info("Dependency found", "lib", lib)
+				logger.Info("dep:needed", "lib", lib)
 			}
 		case DT_SONAME:
 			r.soname = r.readString(uint32(entry.Val))
-			logger.Info("SONAME", "name", r.soname)
+			logger.Info("dep:soname", "name", r.soname)
 		case DT_RUNPATH:
 			r.runpath = r.readString(uint32(entry.Val))
-			logger.Info("RUNPATH", "path", r.runpath)
+			logger.Info("dep:runpath", "path", r.runpath)
 		}
 	}
 }
@@ -1527,7 +1565,7 @@ func (r *ElfReader) readString(offset uint32) string {
 // ReadVersioningMetadata reads GNU versioning information if present
 func (r *ElfReader) ReadVersioningMetadata() error {
 	if r.versymOffset != 0 {
-		logger.Info("Found symbol versioning", "vaddr", fmt.Sprintf("0x%x", r.versymOffset))
+		logger.Info("ver:found", "vaddr", fmt.Sprintf("0x%x", r.versymOffset))
 		// Versym is an array of uint16 indices, one per dynamic symbol
 		// We'll just log found for now, but we could read it if we need to fix indices.
 	}
