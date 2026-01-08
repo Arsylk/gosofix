@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 
 	"strconv"
 
@@ -304,12 +303,13 @@ func (r *ElfReader) ReadElfHeaders() error {
 func (r *ElfReader) ReadPhdrs() error {
 	phtSize := uint64(r.ElfHeader.Phnum) * uint64(r.ElfHeader.Phentsize)
 	if phtSize == 0 {
-		return fmt.Errorf("no program headers found")
+		return fmt.Errorf("phdr:read | no program headers found")
 	}
 	if r.ElfHeader.Phnum > 1024 {
-		return fmt.Errorf("too many program headers: %d (max 1024)", r.ElfHeader.Phnum)
+		return fmt.Errorf("phdr:read | too many headers: %d (max 1024)", r.ElfHeader.Phnum)
 	}
-	logger.Info("pht:read", "offset", r.ElfHeader.PhdrOffset, "entries", r.ElfHeader.Phnum)
+
+	logger.Info("phdr:read", "offset", fmt.Sprintf("0x%x", r.ElfHeader.PhdrOffset), "count", r.ElfHeader.Phnum)
 
 	var err error
 	if r.Phdrs, err = readArray[Elf64_Phdr](r.File, r.ElfHeader.PhdrOffset, uint64(r.ElfHeader.Phnum), "PT_PHDR"); err != nil {
@@ -324,49 +324,18 @@ func (r *ElfReader) ReadPhdrs() error {
 			phdr.Vaddr -= r.BaseAddr
 		}
 
-		if phdr.Type == PT_LOAD && r.phdrPtLoadPageStart == 0 {
-			r.phdrPtLoadPageStart = PageStart(phdr.Vaddr)
-		}
-
-		if phdr.Type == PT_GNU_EH_FRAME {
-			r.ehFrameHdrOffset = phdr.Vaddr
-			r.ehFrameHdrSize = phdr.Memsz
-			logger.Info("phdr | eh_frame", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
-		}
-
-		if phdr.Type == PT_NOTE {
-			r.NoteSegments = append(r.NoteSegments, AddrRange{Start: phdr.Vaddr, End: phdr.Vaddr + phdr.Memsz, Name: ".note"})
-			if r.noteOffset == 0 {
-				r.noteOffset = phdr.Vaddr
-				r.noteSize = phdr.Memsz
-			}
-			logger.Info("phdr | note", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
-		}
-
-		if phdr.Type == PT_TLS {
-			r.tlsOffset = phdr.Vaddr
-			r.tlsSize = phdr.Memsz
-			logger.Info("phdr | tls", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
-		}
-
-		if phdr.Type == PT_GNU_RELRO {
-			r.relroAddr = phdr.Vaddr
-			r.relroSize = phdr.Memsz
-			logger.Info("phdr | relro", "vaddr", fmt.Sprintf("0x%x", phdr.Vaddr), "size", phdr.Memsz)
-		}
-
-		logger.Debug("  + header", "type", phdr.Type.Text(), "offset", phdr.Offset)
+		// Log all program headers with consistent format
+		logger.Debug("phdr:entry",
+			"idx", i,
+			"type", phdr.Type.Text(),
+			"vaddr", fmt.Sprintf("0x%x", phdr.Vaddr),
+			"filesz", phdr.Filesz,
+			"memsz", phdr.Memsz,
+			"flags", fmt.Sprintf("0x%x", phdr.Flags),
+		)
 	}
 
 	return nil
-}
-
-// normalizeAddr converts an absolute address to a relative offset if it's above BaseAddr
-func (r *ElfReader) normalizeAddr(addr uint64) uint64 {
-	if addr >= r.BaseAddr {
-		return addr - r.BaseAddr
-	}
-	return addr
 }
 
 func (r *ElfReader) ReadDyns() error {
@@ -384,14 +353,13 @@ func (r *ElfReader) ReadDyns() error {
 	}
 
 	entryCount := dynamicPhdr.Memsz / uint64(binary.Size(Elf64_Dyn{}))
-	logger.Info("dyn:read", "offset", dynamicPhdr.Offset, "entries", entryCount)
-
 	if entryCount == 0 {
-		return fmt.Errorf("dynamic section has zero size")
+		return fmt.Errorf("dynamic section has zero entries")
 	}
-	logger.Debug("dyn:found", "vaddr", dynamicPhdr.Vaddr, "offset", dynamicPhdr.Offset, "entries", entryCount)
 
-	// Store dynamic section info
+	logger.Info("dyn:read", "vaddr", fmt.Sprintf("0x%x", dynamicPhdr.Vaddr), "entries", entryCount)
+
+	// Store dynamic section info for rebuilder
 	r.dynamicOffset = dynamicPhdr.Vaddr
 	r.dynamicSize = dynamicPhdr.Memsz
 
@@ -401,26 +369,30 @@ func (r *ElfReader) ReadDyns() error {
 		return err
 	}
 
+	// Build map and extract essential fields for rebuilder
 	r.dynMap = make(map[DT_Tag]uint64)
 	for _, entry := range r.Dyns {
 		val := entry.Val
-		// Normalize addresses if they appear to be absolute
+
+		// Normalize addresses relative to base
 		switch entry.Tag {
-		case DT_STRTAB, DT_SYMTAB, DT_REL, DT_RELA, DT_JMPREL,
-			DT_PLTGOT, DT_INIT_ARRAY, DT_FINI_ARRAY,
-			DT_HASH, DT_GNU_HASH, DT_VERSYM, DT_VERNEED:
+		case DT_STRTAB, DT_SYMTAB, DT_REL, DT_RELA, DT_JMPREL, DT_HASH, DT_GNU_HASH, DT_INIT_ARRAY, DT_FINI_ARRAY:
 			if val >= r.BaseAddr {
-				normVal := val - r.BaseAddr
-				logger.Debug("Normalizing dynamic tag", "tag", entry.Tag.Text(), "old", fmt.Sprintf("0x%x", val), "new", fmt.Sprintf("0x%x", normVal))
-				val = normVal
+				val -= r.BaseAddr
+				logger.Debug("dyn:normalize", "tag", entry.Tag.Text(), "val", fmt.Sprintf("0x%x", val))
 			}
 		}
 
+		// Only extract fields actually used by the rebuilder
 		switch entry.Tag {
 		case DT_STRTAB:
 			r.strtabOffset = val
 		case DT_SYMTAB:
 			r.symtabOffset = val
+		case DT_HASH:
+			r.hashOffset = val
+		case DT_GNU_HASH:
+			r.gnuHashOffset = val
 		case DT_REL:
 			r.relOffset = val
 		case DT_RELSZ:
@@ -439,8 +411,6 @@ func (r *ElfReader) ReadDyns() error {
 			}
 		case DT_PLTRELSZ:
 			r.jmprelSize = val
-		case DT_PLTGOT:
-			r.gotOffset = val
 		case DT_INIT_ARRAY:
 			r.initArrayOffset = val
 		case DT_INIT_ARRAYSZ:
@@ -449,39 +419,9 @@ func (r *ElfReader) ReadDyns() error {
 			r.finiArrayOffset = val
 		case DT_FINI_ARRAYSZ:
 			r.finiArraySize = val
-		case DT_INIT:
-			r.initFunc = val // Single function pointer
-		case DT_FINIT:
-			r.finiFunc = val // Single function pointer
-		case DT_PREINIT_ARRAY:
-			r.preinitArrayOffset = val
-		case DT_PREINIT_ARRAYSZ:
-			r.preinitArraySize = val
-		case DT_HASH:
-			r.hashOffset = val
-		case DT_GNU_HASH:
-			r.gnuHashOffset = val
-		case DT_STRSZ:
-			r.strtabSize = val
-		case DT_VERSYM:
-			r.versymOffset = val
-		case DT_VERNEED:
-			r.verneedOffset = val
-		case DT_VERNEEDNUM:
-			r.verneedNum = uint16(val)
-		case DT_FLAGS:
-			r.flags = val
-		case DT_FLAGS_1:
-			r.flags1 = val
-		case DT_SONAME:
-		case DT_RUNPATH:
-		case DT_NEEDED:
-		case DT_RELACOUNT:
-			r.dtRelaCount = val
-		case DT_RELCOUNT:
-			r.dtRelCount = val
 		}
-		logger.Debug("  + dynamic", "tag", entry.Tag.Text(), "val", val)
+
+		logger.Debug("dyn:entry", "tag", entry.Tag.Text(), "val", fmt.Sprintf("0x%x", val))
 		r.dynMap[entry.Tag] = val
 	}
 
@@ -497,485 +437,19 @@ func (r *ElfReader) ReadRelocs() error {
 		return err
 	}
 
-	r.calculateSectionSizes()
-	r.calculatePltInfo()
-	r.calculateTextSection()
-	r.analyzeDataSections()
+	// Simplified: only resolve metadata for logging
+	// The complex section analysis (calculateTextSection, analyzeDataSections, etc.)
+	// is no longer needed as the rebuilder now uses segment-based sections directly.
 	r.ResolveMetadata()
-	r.ReadVersioningMetadata()
 
 	return nil
-}
-
-// collectOccupiedRanges returns all virtual address ranges already known/claimed
-func (r *ElfReader) collectOccupiedRanges() []AddrRange {
-	var ranges []AddrRange
-
-	// PT_LOAD segments that usually contain headers/metadata
-	// For now, we focus on ranges we explicitly identify as sections
-
-	if r.dynamicOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.dynamicOffset, End: r.dynamicOffset + r.dynamicSize, Name: ".dynamic"})
-	}
-	if r.gotOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.gotOffset, End: r.gotOffset + r.gotSize, Name: ".got"})
-	}
-	if r.pltAddr != 0 {
-		ranges = append(ranges, AddrRange{Start: r.pltAddr, End: r.pltAddr + r.pltSize, Name: ".plt"})
-	}
-	if r.initArrayOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.initArrayOffset, End: r.initArrayOffset + r.initArraySize, Name: ".init_array"})
-	}
-	if r.finiArrayOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.finiArrayOffset, End: r.finiArrayOffset + r.finiArraySize, Name: ".fini_array"})
-	}
-	if r.hashOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.hashOffset, End: r.hashOffset + r.hashSize, Name: ".hash"})
-	}
-	if r.gnuHashOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.gnuHashOffset, End: r.gnuHashOffset + r.gnuHashSize, Name: ".gnu.hash"})
-	}
-	if r.symtabOffset != 0 {
-		// Note: new symtab might have different size, but here we track dump locations
-		ranges = append(ranges, AddrRange{Start: r.symtabOffset, End: r.symtabOffset + uint64(len(r.newSymbols)*24), Name: ".dynsym"})
-	}
-	if r.strtabOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.strtabOffset, End: r.strtabOffset + uint64(len(r.newStrtab)), Name: ".dynstr"})
-	}
-	if r.ehFrameHdrOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.ehFrameHdrOffset, End: r.ehFrameHdrOffset + r.ehFrameHdrSize, Name: ".eh_frame_hdr"})
-
-		// .eh_frame follows .eh_frame_hdr - calculate its precise size
-		r.calculateEhFrameSection()
-		if r.ehFrameOffset != 0 && r.ehFrameSize > 0 {
-			ranges = append(ranges, AddrRange{Start: r.ehFrameOffset, End: r.ehFrameOffset + r.ehFrameSize, Name: ".eh_frame"})
-		}
-	}
-	if len(r.NoteSegments) > 0 {
-		ranges = append(ranges, r.NoteSegments...)
-	} else if r.noteOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.noteOffset, End: r.noteOffset + r.noteSize, Name: ".note.gnu.build-id"})
-	}
-	if r.relOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.relOffset, End: r.relOffset + r.relSize, Name: ".rel.dyn"})
-	}
-	if r.relaOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.relaOffset, End: r.relaOffset + r.relaSize, Name: ".rela.dyn"})
-	}
-	if r.jmprelOffset != 0 {
-		ranges = append(ranges, AddrRange{Start: r.jmprelOffset, End: r.jmprelOffset + r.jmprelSize, Name: ".rel.plt"})
-	}
-
-	sort.Slice(ranges, func(i, j int) bool {
-		return ranges[i].Start < ranges[j].Start
-	})
-
-	return ranges
-}
-
-// findExecutableSegments returns all PT_LOAD segments with execute permission
-func (r *ElfReader) findExecutableSegments() []Elf64_Phdr {
-	var execSegments []Elf64_Phdr
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 && (phdr.Flags&PF_R) != 0 {
-			execSegments = append(execSegments, phdr)
-		}
-	}
-	return execSegments
-}
-
-// findLargestGap finds the largest unoccupied address range within a segment.
-// It skips over all occupied ranges and returns the largest gap found.
-func (r *ElfReader) findLargestGap(segStart, segEnd uint64, occupied []AddrRange) (gapStart, gapSize uint64) {
-	current := segStart
-
-	// Skip ELF headers if segment starts at 0
-	if current == 0 {
-		headerEnd := uint64(r.ElfHeader.Ehsize) + uint64(r.ElfHeader.Phnum)*uint64(r.ElfHeader.Phentsize)
-		headerEnd = alignUp(headerEnd, 16)
-		current = headerEnd
-	}
-
-	bestGapStart, bestGapSize := uint64(0), uint64(0)
-
-	for _, occ := range occupied {
-		if occ.End <= current {
-			continue // This range already passed
-		}
-		if occ.Start >= segEnd {
-			break // Beyond this segment
-		}
-
-		// Found a gap before this occupied range
-		if occ.Start > current {
-			gap := occ.Start - current
-			if gap > bestGapSize {
-				bestGapSize = gap
-				bestGapStart = current
-			}
-		}
-
-		// Move past this occupied range
-		if occ.End > current {
-			current = occ.End
-		}
-	}
-
-	// Check for gap at the end
-	if current < segEnd {
-		gap := segEnd - current
-		if gap > bestGapSize {
-			bestGapSize = gap
-			bestGapStart = current
-		}
-	}
-
-	return bestGapStart, bestGapSize
-}
-
-// calculateTextSection finds the largest executable gap to designate as .text
-// This method identifies unoccupied address ranges in executable segments and
-// designates the largest one as the .text section for reverse engineering purposes.
-func (r *ElfReader) calculateTextSection() {
-	occupied := r.collectOccupiedRanges()
-	execSegments := r.findExecutableSegments()
-
-	var bestGapStart, bestGapSize uint64
-
-	for _, phdr := range execSegments {
-		gapStart, gapSize := r.findLargestGap(phdr.Vaddr, phdr.Vaddr+phdr.Memsz, occupied)
-
-		if gapSize > bestGapSize {
-			bestGapSize = gapSize
-			bestGapStart = gapStart
-		}
-	}
-
-	if bestGapSize > 0 {
-		r.textAddr = bestGapStart
-		r.textSize = bestGapSize
-		logger.Info("section | .text", "addr", fmt.Sprintf("0x%x", r.textAddr), "size", r.textSize)
-	}
-}
-
-// calculateEhFrameSection calculates the .eh_frame section location and precise size
-// It typically follows immediately after .eh_frame_hdr
-func (r *ElfReader) calculateEhFrameSection() {
-	if r.ehFrameHdrOffset == 0 || r.ehFrameOffset != 0 {
-		return // Already calculated or not available
-	}
-
-	// .eh_frame starts right after .eh_frame_hdr (aligned to 8 bytes)
-	ehFrameStart := alignUp(r.ehFrameHdrOffset+r.ehFrameHdrSize, 8)
-
-	// Parse the .eh_frame precisely
-	size, err := r.calculateEhFrameSize(ehFrameStart)
-	if err != nil {
-		logger.Warn("eh_frame:size | calc failed", "error", err)
-		return
-	}
-
-	if size > 0 {
-		r.ehFrameOffset = ehFrameStart
-		r.ehFrameSize = size
-		logger.Info("section | .eh_frame", "addr", fmt.Sprintf("0x%x", r.ehFrameOffset), "size", r.ehFrameSize)
-	}
-}
-
-// calculateEhFrameSize parses the .eh_frame data to find its exact end
-func (r *ElfReader) calculateEhFrameSize(start uint64) (uint64, error) {
-	// Find file offset for the virtual address
-	fileOffset := uint64(0)
-	maxVaddr := uint64(0)
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD && start >= phdr.Vaddr && start < phdr.Vaddr+phdr.Memsz {
-			fileOffset = phdr.Offset + (start - phdr.Vaddr)
-			maxVaddr = phdr.Vaddr + phdr.Memsz
-			break
-		}
-	}
-
-	if fileOffset == 0 {
-		return 0, fmt.Errorf("could not find file offset for .eh_frame start at 0x%x", start)
-	}
-
-	currVaddr := start
-	currFileOffset := fileOffset
-
-	for {
-		// Ensure we don't go past segment boundary
-		if currVaddr+4 > maxVaddr {
-			break
-		}
-
-		// Read length (4 bytes)
-		var length uint32
-		if _, err := r.File.Seek(int64(currFileOffset), io.SeekStart); err != nil {
-			return 0, err
-		}
-		if err := binary.Read(r.File, binary.LittleEndian, &length); err != nil {
-			return 0, err
-		}
-
-		if length == 0 {
-			// End of .eh_frame entries
-			currVaddr += 4
-			currFileOffset += 4
-			break
-		}
-
-		entrySize := uint64(0)
-		if length == 0xffffffff {
-			// 64-bit DWARF
-			if currVaddr+12 > maxVaddr {
-				break
-			}
-			var length64 uint64
-			if err := binary.Read(r.File, binary.LittleEndian, &length64); err != nil {
-				return 0, err
-			}
-			entrySize = length64 + 12
-		} else {
-			entrySize = uint64(length) + 4
-		}
-
-		currVaddr += entrySize
-		currFileOffset += entrySize
-
-		if currVaddr >= maxVaddr {
-			break
-		}
-	}
-
-	return currVaddr - start, nil
-}
-
-// analyzeDataSections identifies all header-only sections (.dynamic, .got, .data, .bss, etc)
-func (r *ElfReader) analyzeDataSections() {
-	r.computedSections = nil
-
-	// 1. Fixed metadata sections
-	if r.ehFrameHdrOffset != 0 && r.ehFrameHdrSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".eh_frame_hdr", Type: SHT_PROGBITS, Flags: SHF_ALLOC,
-			Addr: r.ehFrameHdrOffset, Size: r.ehFrameHdrSize, Addralign: 4,
-		})
-
-		// .eh_frame typically follows .eh_frame_hdr
-		// Calculate its location by finding the next section boundary
-		r.calculateEhFrameSection()
-	}
-	if len(r.NoteSegments) > 0 {
-		for i, ns := range r.NoteSegments {
-			name := ".note.gnu.build-id"
-			if i > 0 {
-				name = fmt.Sprintf(".note.%d", i)
-			}
-			r.computedSections = append(r.computedSections, ComputedSection{
-				Name: name, Type: SHT_NOTE, Flags: SHF_ALLOC,
-				Addr: ns.Start, Size: ns.End - ns.Start, Addralign: 4,
-			})
-		}
-	} else if r.noteOffset != 0 && r.noteSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".note.gnu.build-id", Type: SHT_NOTE, Flags: SHF_ALLOC,
-			Addr: r.noteOffset, Size: r.noteSize, Addralign: 4,
-		})
-	}
-
-	// Add .eh_frame if we calculated it
-	if r.ehFrameOffset != 0 && r.ehFrameSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".eh_frame", Type: SHT_PROGBITS, Flags: SHF_ALLOC,
-			Addr: r.ehFrameOffset, Size: r.ehFrameSize, Addralign: 8,
-		})
-	}
-
-	// 2. Dynamic sections
-	if r.dynamicOffset != 0 && r.dynamicSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".dynamic", Type: SHT_DYNAMIC, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: r.dynamicOffset, Size: r.dynamicSize, Addralign: 8, Entsize: 16,
-		})
-	}
-	if r.gotOffset != 0 && r.gotSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".got", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: r.gotOffset, Size: r.gotSize, Addralign: 8, Entsize: 8,
-		})
-	}
-	if r.initArrayOffset != 0 && r.initArraySize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".init_array", Type: SHT_INIT_ARRAY, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: r.initArrayOffset, Size: r.initArraySize, Addralign: 8, Entsize: 8,
-		})
-	}
-	if r.finiArrayOffset != 0 && r.finiArraySize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".fini_array", Type: SHT_FINI_ARRAY, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: r.finiArrayOffset, Size: r.finiArraySize, Addralign: 8, Entsize: 8,
-		})
-	}
-
-	// 2.5. Versioning sections - Link field will be set later by rebuilder to point to .dynsym
-	if r.versymOffset != 0 && r.symCount > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".gnu.version", Type: SHT_GNU_VERSYM, Flags: SHF_ALLOC,
-			Addr: r.versymOffset, Size: r.symCount * 2, Addralign: 2, Entsize: 2,
-			// Link will be set to .dynsym index by rebuilder
-		})
-	}
-
-	// 3. PLT and Text
-	if r.pltAddr != 0 && r.pltSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".plt", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_EXECINSTR,
-			Addr: r.pltAddr, Size: r.pltSize, Addralign: 16,
-		})
-	}
-	if r.textAddr != 0 && r.textSize > 0 {
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".text", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_EXECINSTR,
-			Addr: r.textAddr, Size: r.textSize, Addralign: 16,
-		})
-	}
-
-	// 4. Collect all data and BSS ranges from writable segments, then merge into single sections
-	var dataRanges []AddrRange
-	var bssRanges []AddrRange
-
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD && (phdr.Flags&PF_W) != 0 {
-			// Collect .data range
-			if phdr.Filesz > 0 {
-				addr := phdr.Vaddr
-				size := phdr.Filesz
-				// Skip headers if this segment starts at 0
-				if addr == 0 {
-					headerSize := uint64(r.ElfHeader.Ehsize) + uint64(r.ElfHeader.Phnum)*uint64(r.ElfHeader.Phentsize)
-					headerSize = (headerSize + 15) &^ 15
-					addr += headerSize
-					size -= headerSize
-				}
-				if size > 0 {
-					dataRanges = append(dataRanges, AddrRange{Start: addr, End: addr + size, Name: ".data"})
-				}
-			}
-			// Collect .bss range
-			if phdr.Memsz > phdr.Filesz {
-				bssAddr := phdr.Vaddr + phdr.Filesz
-				bssSize := phdr.Memsz - phdr.Filesz
-				bssRanges = append(bssRanges, AddrRange{Start: bssAddr, End: bssAddr + bssSize, Name: ".bss.ram"})
-			}
-		}
-	}
-
-	// 5. Separate .data.rel.ro if PT_GNU_RELRO is present
-	if r.relroAddr != 0 && r.relroSize > 0 {
-		relroRanges := []AddrRange{{Start: r.relroAddr, End: r.relroAddr + r.relroSize, Name: ".data.rel.ro"}}
-
-		// Identify sections that fall within RELRO
-		var inRelro []AddrRange
-		for _, cs := range r.computedSections {
-			if cs.Addr >= r.relroAddr && cs.Addr+cs.Size <= r.relroAddr+r.relroSize {
-				inRelro = append(inRelro, AddrRange{Start: cs.Addr, End: cs.Addr + cs.Size, Name: cs.Name})
-			}
-		}
-
-		// Subtract these sections from RELRO range to find purely RELRO areas
-		if len(inRelro) > 0 {
-			sort.Slice(inRelro, func(i, j int) bool { return inRelro[i].Start < inRelro[j].Start })
-
-			var finalRelro []AddrRange
-			curr := r.relroAddr
-			for _, ir := range inRelro {
-				if ir.Start > curr {
-					finalRelro = append(finalRelro, AddrRange{Start: curr, End: ir.Start, Name: ".data.rel.ro"})
-				}
-				curr = ir.End
-			}
-			if curr < r.relroAddr+r.relroSize {
-				finalRelro = append(finalRelro, AddrRange{Start: curr, End: r.relroAddr + r.relroSize, Name: ".data.rel.ro"})
-			}
-			relroRanges = finalRelro
-		}
-
-		for i, rr := range relroRanges {
-			name := ".data.rel.ro"
-			if i > 0 {
-				name = fmt.Sprintf(".data.rel.ro.%d", i)
-			}
-			r.computedSections = append(r.computedSections, ComputedSection{
-				Name: name, Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-				Addr: rr.Start, Size: rr.End - rr.Start, Addralign: 16,
-			})
-		}
-
-		// Split dataRanges to exclude the RELRO part
-		var newDataRanges []AddrRange
-		for _, dr := range dataRanges {
-			// If RELRO is inside or overlaps with this range
-			if r.relroAddr >= dr.Start && r.relroAddr < dr.End {
-				// Part before RELRO
-				if r.relroAddr > dr.Start {
-					newDataRanges = append(newDataRanges, AddrRange{Start: dr.Start, End: r.relroAddr, Name: ".data"})
-				}
-				// Part after RELRO
-				relroEnd := r.relroAddr + r.relroSize
-				if relroEnd < dr.End {
-					newDataRanges = append(newDataRanges, AddrRange{Start: relroEnd, End: dr.End, Name: ".data"})
-				}
-			} else {
-				newDataRanges = append(newDataRanges, dr)
-			}
-		}
-		dataRanges = newDataRanges
-	}
-
-	// Merge and create single .data section
-	if len(dataRanges) > 0 {
-		minAddr := dataRanges[0].Start
-		maxEnd := dataRanges[0].End
-		for _, dataRange := range dataRanges {
-			if dataRange.Start < minAddr {
-				minAddr = dataRange.Start
-			}
-			if dataRange.End > maxEnd {
-				maxEnd = dataRange.End
-			}
-		}
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".data", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
-		})
-		logger.Info("section | .data (merged)", "ranges", len(dataRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
-	}
-
-	// Merge and create single .bss section
-	if len(bssRanges) > 0 {
-		minAddr := bssRanges[0].Start
-		maxEnd := bssRanges[0].End
-		for _, bssRange := range bssRanges {
-			if bssRange.Start < minAddr {
-				minAddr = bssRange.Start
-			}
-			if bssRange.End > maxEnd {
-				maxEnd = bssRange.End
-			}
-		}
-		r.computedSections = append(r.computedSections, ComputedSection{
-			Name: ".bss.ram", Type: SHT_PROGBITS, Flags: SHF_ALLOC | SHF_WRITE,
-			Addr: minAddr, Size: maxEnd - minAddr, Addralign: 16,
-		})
-		logger.Info("section | .bss.ram (merged)", "ranges", len(bssRanges), "addr", fmt.Sprintf("0x%x", minAddr), "size", maxEnd-minAddr)
-	}
 }
 
 // readSymbols reads the symbol table
 func (r *ElfReader) readSymbols() error {
 	var err error
-	if r.symCount, err = calculateSymbolCount(r.File, r.dynMap); err != nil {
-		return fmt.Errorf("failed to calculate symbol count: %w", err)
+	if r.symCount, err = r.calculateSymbolCount(); err != nil {
+		return fmt.Errorf("sym:read | %w", err)
 	}
 
 	if r.symCount == 0 {
@@ -1030,58 +504,6 @@ func (r *ElfReader) readRelocationTables() error {
 	return nil
 }
 
-// calculateSectionSizes computes sizes for .hash, .gnu.hash, and .got sections
-func (r *ElfReader) calculateSectionSizes() {
-	// Calculate .hash size
-	if r.hashOffset != 0 {
-		if size, err := calculateHashSize(r.File, r.hashOffset); err == nil {
-			r.hashSize = size
-		}
-	}
-
-	// Calculate .gnu.hash size
-	if r.gnuHashOffset != 0 {
-		if size, err := calculateGnuHashSize(r.File, r.gnuHashOffset, r.symCount); err == nil {
-			r.gnuHashSize = size
-		}
-	}
-
-	// Calculate .got size: 3 reserved + PLT entries
-	if r.gotOffset != 0 {
-		pltEntries := uint64(0)
-		if r.jmprelEntry > 0 && r.jmprelSize > 0 {
-			pltEntries = r.jmprelSize / r.jmprelEntry
-		}
-		r.gotSize = (3 + pltEntries) * 8
-	}
-}
-
-// calculatePltInfo computes PLT address and size
-func (r *ElfReader) calculatePltInfo() {
-	if r.jmprelSize == 0 || r.jmprelEntry == 0 {
-		return
-	}
-
-	pltCount := r.jmprelSize / r.jmprelEntry
-	r.pltSize = ARM64_PLT0_SIZE + (pltCount * ARM64_PLT_ENTRY_SIZE)
-
-	// PLT usually follows .rela.plt immediately (16-byte aligned)
-	estimatedPltAddr := alignUp(r.jmprelOffset+r.jmprelSize, 16)
-
-	// Verify it's in an executable segment
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 {
-			if estimatedPltAddr >= phdr.Vaddr && estimatedPltAddr < phdr.Vaddr+phdr.Memsz {
-				r.pltAddr = estimatedPltAddr
-				logger.Info("section | .plt", "addr", fmt.Sprintf("0x%x", r.pltAddr), "size", r.pltSize)
-				return
-			}
-		}
-	}
-
-	logger.Warn("plt:addr | unknown")
-}
-
 func (r *ElfReader) FixRelocs(base uint64) error {
 	logger.Info("reloc:fix", "base", base)
 
@@ -1113,7 +535,7 @@ func (r *ElfReader) fixSingleRel(rel *Elf64_Rel, base uint64) {
 	relocType := rel.Type()
 	relocSym := rel.Sym()
 	rsym := r.Symbols[relocSym]
-	rname := readStrtabString(r.File, r.strtabOffset, rsym.St_Name)
+	rname := r.readStrtabString(rsym.St_Name)
 
 	L := base + rel.Offset // Location in memory
 	S := rsym.St_Value     // Symbol value
@@ -1141,7 +563,7 @@ func (r *ElfReader) fixSingleRela(rela *Elf64_Rela, base uint64) {
 	relocType := rela.Type()
 	relocSym := rela.Sym()
 	rsym := r.Symbols[relocSym]
-	rname := readStrtabString(r.File, r.strtabOffset, rsym.St_Name)
+	rname := r.readStrtabString(rsym.St_Name)
 
 	L := base + rela.Offset  // Location in memory
 	A := uint64(rela.Addend) // Addend
@@ -1235,7 +657,7 @@ func (r *ElfReader) processSymbols() ([]Elf64_Sym, []Elf64_Sym) {
 		}
 
 		// Read original symbol name
-		symName := readStrtabString(r.File, r.strtabOffset, sym.St_Name)
+		symName := r.readStrtabString(sym.St_Name)
 		logger.Debug("sym:process", "idx", i, "name", symName, "value", sym.St_Value, "bind", sym.stBind().Text(), "type", sym.stType())
 
 		// Update name offset in new strtab
@@ -1283,54 +705,52 @@ func (r *ElfReader) WriteFixedElf(outputPath string, baseAddr uint64) error {
 	return nil
 }
 
-// calculateSymbolCount reads the GNU Hash table and determines the total number of symbols.
-func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, error) {
-	hashOffset := dynMap[DT_HASH]
-	gnuHashOffset := dynMap[DT_GNU_HASH]
-
-	if hashOffset != 0 {
-		var header HashHeader
+// calculateSymbolCount determines the total number of symbols using hash tables
+func (r *ElfReader) calculateSymbolCount() (uint64, error) {
+	// Try .hash table first (simpler, direct symbol count)
+	if r.hashOffset != 0 {
 		logger.Info("sym:count | via hash")
 
-		if _, err := file.Seek(int64(hashOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("failed to seek to hash table: %w", err)
+		if _, err := r.File.Seek(int64(r.hashOffset), io.SeekStart); err != nil {
+			return 0, fmt.Errorf("hash:seek | %w", err)
 		}
-		if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
-			return 0, fmt.Errorf("failed to read hash header: %w", err)
+
+		var header HashHeader
+		if err := binary.Read(r.File, binary.LittleEndian, &header); err != nil {
+			return 0, fmt.Errorf("hash:read | %w", err)
 		}
 
 		return uint64(header.Nchain), nil
 	}
 
-	if gnuHashOffset != 0 {
-		// 1. Read GNU Hash Header
-		var header GNUHashHeader
+	// Fall back to .gnu.hash table
+	if r.gnuHashOffset != 0 {
 		logger.Info("sym:count | via gnu_hash")
 
-		if _, err := file.Seek(int64(gnuHashOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("failed to seek to GNU hash table: %w", err)
-		}
-		if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
-			return 0, fmt.Errorf("failed to read GNU hash header: %w", err)
+		if _, err := r.File.Seek(int64(r.gnuHashOffset), io.SeekStart); err != nil {
+			return 0, fmt.Errorf("gnu_hash:seek | %w", err)
 		}
 
-		// 2. Calculate pointers to buckets and chains
+		var header GNUHashHeader
+		if err := binary.Read(r.File, binary.LittleEndian, &header); err != nil {
+			return 0, fmt.Errorf("gnu_hash:read | %w", err)
+		}
+
+		// Calculate bucket and chain offsets
 		bloomSize := header.Maskwords * 8
-		bucketsOffset := gnuHashOffset + 16 + uint64(bloomSize)
+		bucketsOffset := r.gnuHashOffset + 16 + uint64(bloomSize)
 		chainsOffset := bucketsOffset + uint64(header.Nbuckets*4)
 
-		// 3. Read Buckets
+		// Read buckets to find max symbol index
 		buckets := make([]uint32, header.Nbuckets)
-		if _, err := file.Seek(int64(bucketsOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("failed to seek to GNU hash buckets: %w", err)
+		if _, err := r.File.Seek(int64(bucketsOffset), io.SeekStart); err != nil {
+			return 0, fmt.Errorf("gnu_hash:buckets_seek | %w", err)
 		}
-		if err := binary.Read(file, binary.LittleEndian, &buckets); err != nil {
-			return 0, fmt.Errorf("failed to read GNU hash buckets: %w", err)
+		if err := binary.Read(r.File, binary.LittleEndian, &buckets); err != nil {
+			return 0, fmt.Errorf("gnu_hash:buckets_read | %w", err)
 		}
 
-		// 4. Find max symbol index
-		// Symbols are sorted by hash bucket. The highest symbol index is in the chain
-		// of the non-empty bucket with the highest starting index.
+		// Find max bucket index
 		maxBucketIndex := uint32(0)
 		for _, bptr := range buckets {
 			if bptr > maxBucketIndex {
@@ -1339,173 +759,74 @@ func calculateSymbolCount(file *os.File, dynMap map[DT_Tag]uint64) (uint64, erro
 		}
 
 		if maxBucketIndex == 0 {
-			// All buckets are empty
 			return uint64(header.Symndx), nil
 		}
 
-		// Follow the chain starting at maxBucketIndex
+		// Follow chain to find highest symbol index
 		currentSymIndex := uint64(maxBucketIndex)
-		for {
+		for currentSymIndex < 1000000 {
 			chainIndex := currentSymIndex - uint64(header.Symndx)
-			if _, err := file.Seek(int64(chainsOffset+chainIndex*4), io.SeekStart); err != nil {
+			if _, err := r.File.Seek(int64(chainsOffset+chainIndex*4), io.SeekStart); err != nil {
 				return currentSymIndex, nil
 			}
 
 			var chainVal uint32
-			if err := binary.Read(file, binary.LittleEndian, &chainVal); err != nil {
+			if err := binary.Read(r.File, binary.LittleEndian, &chainVal); err != nil {
 				return currentSymIndex, nil
 			}
 
-			// Bit 0 = 1 marks the end of the chain (last entry for this hash bucket)
+			// Bit 0 = 1 marks end of chain
 			if (chainVal & 1) != 0 {
 				return currentSymIndex + 1, nil
 			}
 			currentSymIndex++
-
-			// Guard against infinite loop
-			if currentSymIndex > 1000000 {
-				break
-			}
 		}
 
 		return currentSymIndex + 1, nil
 	}
 
-	return 0, fmt.Errorf("missing DT_HASH or DT_GNU_HASH or DT_SYMTAB/DT_SYMENT")
+	return 0, fmt.Errorf("sym:count | missing DT_HASH or DT_GNU_HASH")
 }
 
-// calculateGnuHashSize calculates the total size of the .gnu.hash section.
-func calculateGnuHashSize(file *os.File, gnuHashOffset uint64, symCount uint64) (uint64, error) {
-	if gnuHashOffset == 0 {
-		return 0, fmt.Errorf("invalid .gnu.hash offset")
-	}
-
-	// 1. Read GNU Hash Header
-	var header GNUHashHeader
-	if _, err := file.Seek(int64(gnuHashOffset), io.SeekStart); err != nil {
-		return 0, fmt.Errorf("failed to seek to GNU hash table: %w", err)
-	}
-	if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
-		return 0, fmt.Errorf("failed to read GNU hash header: %w", err)
-	}
-
-	// 2. Calculate the total size
-	bloomSize := uint64(header.Maskwords) * 8
-	bucketsSize := uint64(header.Nbuckets) * 4
-	chainsSize := (symCount - uint64(header.Symndx)) * 4
-
-	totalSize := uint64(16) + bloomSize + bucketsSize + chainsSize
-	return totalSize, nil
-}
-
-// calculateHashSize calculates the total size of the classic .hash section.
-func calculateHashSize(file *os.File, hashOffset uint64) (uint64, error) {
-	if hashOffset == 0 {
-		return 0, fmt.Errorf("invalid .hash offset")
-	}
-
-	// Read the header (nbucket and nchain)
-	var nbucket, nchain uint32
-	if _, err := file.Seek(int64(hashOffset), io.SeekStart); err != nil {
-		return 0, fmt.Errorf("failed to seek to hash table: %w", err)
-	}
-	if err := binary.Read(file, binary.LittleEndian, &nbucket); err != nil {
-		return 0, fmt.Errorf("failed to read nbucket: %w", err)
-	}
-	if err := binary.Read(file, binary.LittleEndian, &nchain); err != nil {
-		return 0, fmt.Errorf("failed to read nchain: %w", err)
-	}
-
-	// Calculate total size: header (8 bytes) + buckets + chains
-	totalSize := uint64(8 + (nbucket * 4) + (nchain * 4))
-	return totalSize, nil
-}
-
-func readStrtabString(file *os.File, strtabOffset uint64, nameOffset uint32) string {
-	if nameOffset == 0 {
+// readStrtabString reads a null-terminated string from the string table at the given name offset
+func (r *ElfReader) readStrtabString(nameOffset uint32) string {
+	if nameOffset == 0 || r.strtabOffset == 0 {
 		return ""
 	}
 
-	// Get file size
-	fileInfo, err := file.Stat()
+	fileInfo, err := r.File.Stat()
 	if err != nil {
-		logger.Warn("Failed to stat file for string reading", "error", err)
-		return ""
-	}
-	fileSize := fileInfo.Size()
-
-	offset := strtabOffset + uint64(nameOffset)
-	if offset >= uint64(fileSize) {
-		logger.Warn("String offset out of bounds", "offset", offset, "fileSize", fileSize)
+		logger.Warn("strtab:read | stat failed", "error", err)
 		return ""
 	}
 
-	// Seek to the string position
-	_, err = file.Seek(int64(offset), io.SeekStart)
-	if err != nil {
-		logger.Warn("Failed to seek to string", "offset", offset, "error", err)
+	offset := r.strtabOffset + uint64(nameOffset)
+	if offset >= uint64(fileInfo.Size()) {
+		logger.Warn("strtab:read | offset out of bounds", "offset", fmt.Sprintf("0x%x", offset), "fileSize", fileInfo.Size())
 		return ""
 	}
 
-	// Read until null terminator or end of file, with reasonable limit
+	if _, err = r.File.Seek(int64(offset), io.SeekStart); err != nil {
+		logger.Warn("strtab:read | seek failed", "offset", fmt.Sprintf("0x%x", offset), "error", err)
+		return ""
+	}
+
 	var result []byte
 	buf := make([]byte, 1)
-	maxLen := 1024 // Prevent reading extremely long strings
+	maxLen := 1024
 
 	for len(result) < maxLen {
-		_, err := file.Read(buf)
-		if err != nil || buf[0] == 0 {
+		if _, err := r.File.Read(buf); err != nil || buf[0] == 0 {
 			break
 		}
 		result = append(result, buf[0])
 	}
 
 	if len(result) >= maxLen {
-		logger.Warn("String too long, truncated", "maxLen", maxLen)
+		logger.Warn("strtab:read | truncated", "maxLen", maxLen)
 	}
 
 	return string(result)
-}
-
-// readIntoArray reads up to 'count' elements of type T from file at the given offset.
-// Returns the successfully read elements and the actual count. On EOF, returns partial results without error.
-func readArray[T any](file *os.File, offset uint64, count uint64, name string) ([]T, error) {
-	if count == 0 {
-		return []T{}, nil
-	}
-
-	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
-	}
-
-	// Try to read the full array first (most efficient for common case)
-	array := make([]T, count)
-	if err := binary.Read(file, binary.LittleEndian, array); err == nil {
-		return array, nil
-	}
-
-	// On error, fall back to reading element by element for partial results
-	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
-	}
-
-	result := make([]T, 0, count)
-	for i := uint64(0); i < count; i++ {
-		var elem T
-		if err := binary.Read(file, binary.LittleEndian, &elem); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				// Return what we have so far
-				if len(result) > 0 {
-					logger.Warn("partial read", "name", name, "expected", count, "got", len(result))
-				}
-				return result, nil
-			}
-			return nil, fmt.Errorf("failed to read %s element %d at 0x%x: %w", name, i, offset, err)
-		}
-		result = append(result, elem)
-	}
-
-	return result, nil
 }
 
 // ResolveMetadata resolves offsets for strings like soname, needed libs, and runpath
@@ -1562,99 +883,43 @@ func (r *ElfReader) readString(offset uint32) string {
 	return str
 }
 
-// ReadVersioningMetadata reads GNU versioning information if present
-func (r *ElfReader) ReadVersioningMetadata() error {
-	if r.versymOffset != 0 {
-		logger.Info("ver:found", "vaddr", fmt.Sprintf("0x%x", r.versymOffset))
-		// Versym is an array of uint16 indices, one per dynamic symbol
-		// We'll just log found for now, but we could read it if we need to fix indices.
+// readIntoArray reads up to 'count' elements of type T from file at the given offset.
+// Returns the successfully read elements and the actual count. On EOF, returns partial results without error.
+func readArray[T any](file *os.File, offset uint64, count uint64, name string) ([]T, error) {
+	if count == 0 {
+		return []T{}, nil
 	}
 
-	if r.verneedOffset != 0 && r.verneedNum > 0 {
-		logger.Info("Reading version requirements", "vaddr", fmt.Sprintf("0x%x", r.verneedOffset), "count", r.verneedNum)
-		// Verneed is a linked list of Elf64_Verneed structures
-		curr := r.verneedOffset
-		for i := uint16(0); i < r.verneedNum; i++ {
-			vn, err := readArray[Elf64_Verneed](r.File, curr, 1, "DT_VERNEED")
-			if err != nil || len(vn) == 0 {
-				break
-			}
-			file := r.readString(vn[0].File)
-			logger.Info("  + required from", "file", file, "aux_count", vn[0].Cnt)
+	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
+	}
 
-			// Read aux entries
-			auxCurr := curr + uint64(vn[0].Aux)
-			for j := uint16(0); j < vn[0].Cnt; j++ {
-				vna, err := readArray[Elf64_Vernaux](r.File, auxCurr, 1, "DT_VERNAUX")
-				if err != nil || len(vna) == 0 {
-					break
+	// Try to read the full array first (most efficient for common case)
+	array := make([]T, count)
+	if err := binary.Read(file, binary.LittleEndian, array); err == nil {
+		return array, nil
+	}
+
+	// On error, fall back to reading element by element for partial results
+	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
+	}
+
+	result := make([]T, 0, count)
+	for i := uint64(0); i < count; i++ {
+		var elem T
+		if err := binary.Read(file, binary.LittleEndian, &elem); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				// Return what we have so far
+				if len(result) > 0 {
+					logger.Warn("partial read", "name", name, "expected", count, "got", len(result))
 				}
-				name := r.readString(vna[0].Name)
-				logger.Debug("    - version", "name", name)
-				if vna[0].Next == 0 {
-					break
-				}
-				auxCurr += uint64(vna[0].Next)
+				return result, nil
 			}
-
-			if vn[0].Next == 0 {
-				break
-			}
-			curr += uint64(vn[0].Next)
+			return nil, fmt.Errorf("failed to read %s element %d at 0x%x: %w", name, i, offset, err)
 		}
-	}
-	return nil
-}
-
-// calculateVerneedSize calculates the total size of the verneed section
-// by traversing the linked list of Elf64_Verneed and Elf64_Vernaux structures
-func (r *ElfReader) calculateVerneedSize() uint64 {
-	if r.verneedOffset == 0 || r.verneedNum == 0 {
-		return 0
+		result = append(result, elem)
 	}
 
-	minAddr := r.verneedOffset
-	maxAddr := r.verneedOffset
-
-	// Traverse the verneed linked list to find extent
-	curr := r.verneedOffset
-	for i := uint16(0); i < r.verneedNum; i++ {
-		vn, err := readArray[Elf64_Verneed](r.File, curr, 1, "DT_VERNEED")
-		if err != nil || len(vn) == 0 {
-			break
-		}
-
-		// Update max address to include this Verneed struct
-		if curr+uint64(binary.Size(Elf64_Verneed{})) > maxAddr {
-			maxAddr = curr + uint64(binary.Size(Elf64_Verneed{}))
-		}
-
-		// Traverse aux entries
-		auxCurr := curr + uint64(vn[0].Aux)
-		for j := uint16(0); j < vn[0].Cnt; j++ {
-			vna, err := readArray[Elf64_Vernaux](r.File, auxCurr, 1, "DT_VERNAUX")
-			if err != nil || len(vna) == 0 {
-				break
-			}
-
-			// Update max address to include this Vernaux struct
-			if auxCurr+uint64(binary.Size(Elf64_Vernaux{})) > maxAddr {
-				maxAddr = auxCurr + uint64(binary.Size(Elf64_Vernaux{}))
-			}
-
-			if vna[0].Next == 0 {
-				break
-			}
-			auxCurr += uint64(vna[0].Next)
-		}
-
-		if vn[0].Next == 0 {
-			break
-		}
-		curr += uint64(vn[0].Next)
-	}
-
-	size := maxAddr - minAddr
-	logger.Debug("Calculated verneed size", "start", fmt.Sprintf("0x%x", minAddr), "end", fmt.Sprintf("0x%x", maxAddr), "size", size)
-	return size
+	return result, nil
 }
