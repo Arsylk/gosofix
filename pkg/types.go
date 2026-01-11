@@ -1,6 +1,10 @@
 package sofixer
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/ianlancetaylor/demangle"
+)
 
 // Elf64_Ehdr represents the main ELF header structure (e_ident + rest of header).
 type Elf64_Ehdr struct {
@@ -28,14 +32,14 @@ type Elf64_Ehdr struct {
 
 // Elf64_Phdr represents a 64-bit program header entry (Elf64_Phdr).
 type Elf64_Phdr struct {
-	Type   PT_Type // Segment type
-	Flags  uint32  // Segment flags
-	Offset uint64  // Segment file offset
-	Vaddr  uint64  // Segment virtual address
-	Paddr  uint64  // Segment physical address
-	Filesz uint64  // Segment file size
-	Memsz  uint64  // Segment memory size
-	Align  uint64  // Segment alignment
+	Type   PT_Type  // Segment type
+	Flags  PF_Flags // Segment flags
+	Offset uint64   // Segment file offset
+	Vaddr  uint64   // Segment virtual address
+	Paddr  uint64   // Segment physical address
+	Filesz uint64   // Segment file size
+	Memsz  uint64   // Segment memory size
+	Align  uint64   // Segment alignment
 }
 
 // Elf64_Shdr represents a 64-bit section header entry (Elf64_Shdr).
@@ -81,6 +85,21 @@ type Elf64_Sym struct {
 	St_Size  uint64 // Size of the symbol
 }
 
+const (
+	ELFCLASS64 = 2
+
+	ET_DYN     = 3
+	EM_AARCH64 = 183
+
+	SHF_WRITE     = 0x1
+	SHF_ALLOC     = 0x2
+	SHF_EXECINSTR = 0x4
+	SHF_INFO_LINK = 0x40
+
+	ARM64_PLT0_SIZE      = 32
+	ARM64_PLT_ENTRY_SIZE = 16
+)
+
 type PT_Type uint32
 
 const (
@@ -95,11 +114,36 @@ const (
 	PT_GNU_RELRO    PT_Type = 0x6474e552
 )
 
+type PF_Flags uint32
+
 const (
-	PF_X = 1 // Execute
-	PF_W = 2 // Write
-	PF_R = 4 // Read
+	PF_X PF_Flags = 1 // Execute
+	PF_W PF_Flags = 2 // Write
+	PF_R PF_Flags = 4 // Read
 )
+
+func (f PF_Flags) Text() string {
+	var s string
+	if (f & PF_R) != 0 {
+		s += "PF_R"
+	}
+	if (f & PF_W) != 0 {
+		if s != "" {
+			s += "|"
+		}
+		s += "PF_W"
+	}
+	if (f & PF_X) != 0 {
+		if s != "" {
+			s += "|"
+		}
+		s += "PF_X"
+	}
+	if s == "" {
+		return "0"
+	}
+	return s
+}
 
 func (sym Elf64_Sym) IsEmptySymbol() bool {
 	return sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0
@@ -142,7 +186,7 @@ const (
 	DT_STRSZ           DT_Tag = 10
 	DT_SYMENT          DT_Tag = 11
 	DT_INIT            DT_Tag = 12
-	DT_FINIT           DT_Tag = 13
+	DT_FINI            DT_Tag = 13
 	DT_SONAME          DT_Tag = 14
 	DT_RPATH           DT_Tag = 15
 	DT_SYMBOLIC        DT_Tag = 16
@@ -294,6 +338,10 @@ func (t DT_Tag) Text() string {
 		return "DT_STRSZ"
 	case DT_SYMENT:
 		return "DT_SYMENT"
+	case DT_INIT:
+		return "DT_INIT"
+	case DT_FINI:
+		return "DT_FINI"
 	case DT_SONAME:
 		return "DT_SONAME"
 	case DT_PLTREL:
@@ -340,11 +388,7 @@ type RelocationType uint32
 const (
 	R_AARCH64_NONE   RelocationType = 0x0   // 0
 	R_AARCH64_ABS64  RelocationType = 0x101 // 257 (Direct 64-bit reference)
-	R_AARCH64_ABS32  RelocationType = 0x102 // 258
-	R_AARCH64_ABS16  RelocationType = 0x103 // 259
 	R_AARCH64_PREL64 RelocationType = 0x104 // 260 (PC-relative 64-bit reference)
-	R_AARCH64_PREL32 RelocationType = 0x105 // 261
-	R_AARCH64_PREL16 RelocationType = 0x106 // 262
 
 	// Used for dynamic linker fixups
 	R_AARCH64_COPY       RelocationType = 0x108 // 264
@@ -367,16 +411,8 @@ func (r RelocationType) Text() string {
 		return "R_AARCH64_NONE"
 	case R_AARCH64_ABS64:
 		return "R_AARCH64_ABS64"
-	case R_AARCH64_ABS32:
-		return "R_AARCH64_ABS32"
-	case R_AARCH64_ABS16:
-		return "R_AARCH64_ABS16"
 	case R_AARCH64_PREL64:
 		return "R_AARCH64_PREL64"
-	case R_AARCH64_PREL32:
-		return "R_AARCH64_PREL32"
-	case R_AARCH64_PREL16:
-		return "R_AARCH64_PREL16"
 	case R_AARCH64_COPY:
 		return "R_AARCH64_COPY"
 	case R_AARCH64_ADR_PREL21:
@@ -437,6 +473,27 @@ const (
 	STT_TLS     SymbolType = 6
 )
 
+func (t SymbolType) Text() string {
+	switch t {
+	case STT_NOTYPE:
+		return "STT_NOTYPE"
+	case STT_OBJECT:
+		return "STT_OBJECT"
+	case STT_FUNC:
+		return "STT_FUNC"
+	case STT_SECTION:
+		return "STT_SECTION"
+	case STT_FILE:
+		return "STT_FILE"
+	case STT_COMMON:
+		return "STT_COMMON"
+	case STT_TLS:
+		return "STT_TLS"
+	default:
+		return fmt.Sprintf("STT_UNKNOWN(%d)", t)
+	}
+}
+
 // Helper functions for symbol info
 func (s Elf64_Sym) stBind() SymbolBinding {
 	return SymbolBinding(s.St_Info >> 4)
@@ -466,9 +523,18 @@ func (r Elf64_Rela) Sym() uint32 {
 	return uint32(r.Info >> 32)
 }
 
-func PageStart(addr uint64) uint64 {
-	mask := ^(0x1000 - 1)
-	return addr & uint64(mask)
+// HashHeader represents the initial part of the DT_HASH table.
+type HashHeader struct {
+	Nbucket uint32
+	Nchain  uint32
+}
+
+// GNUHashHeader represents the initial part of the DT_GNU_HASH table.
+type GNUHashHeader struct {
+	Nbuckets  uint32
+	Symndx    uint32
+	Maskwords uint32
+	Shift2    uint32
 }
 
 // AddrRange represents a range of virtual addresses occupied by a section
@@ -489,4 +555,27 @@ type ComputedSection struct {
 	Info      uint32
 	Addralign uint64
 	Entsize   uint64
+}
+
+// AlignUp rounds up 'value' to the next multiple of 'align'
+func AlignUp(value, align uint64) uint64 {
+	if align == 0 {
+		return value
+	}
+	return (value + align - 1) & ^(align - 1)
+}
+
+func PageStart(addr uint64) uint64 {
+	mask := ^(0x1000 - 1)
+	return addr & uint64(mask)
+}
+
+// DemangleSymbol attempts to demangle a C++ mangled symbol name.
+// Returns the demangled name or the original if demangling fails.
+func DemangleSymbol(name string) string {
+	result, err := demangle.ToString(name)
+	if err != nil {
+		return name
+	}
+	return result
 }

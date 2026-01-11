@@ -20,17 +20,12 @@ $(TARGET): $(GOSOURCES)
 
 
 tests/generated.so: $(TARGET)
-	$(TARGET) -d tests/saitcza.so_dump_0x76c8436000.so 0x76c8436000 tests/generated.so
+	$(TARGET) -d tests/jiagu_0x6c7640a000.so 0x6c7640a000 tests/generated.so
 
 fix: tests/generated.so
 
-tests/generated.readelf: fix
-	@readelf --all tests/generated.so 2> tests/generated.readelf 1> tests/generated.readelf
-
-test: tests/generated.readelf
-
-baseline:
-	@readelf --all tests/saitcza.so
+test: fix
+	@readelf --all tests/generated.so
 
 clean:
 	@rm -rf $(DIST_DIR)

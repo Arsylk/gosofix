@@ -1,499 +1,665 @@
 package sofixer
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 )
 
-// ElfRebuilder handles the reconstruction of a valid ELF file from Android memory dumps.
-//
-// SIMPLIFIED APPROACH (Ghidra-optimized):
-// - Only create essential sections that Ghidra needs
-// - Use header-only sections for metadata (point to existing PT_LOAD data)
-// - Rebuilt sections (.dynstr, .dynsym) placed at end of file to avoid overlaps
-//
-// SECTIONS CREATED:
-// 1. NULL         - Required first section
-// 2. .dynstr      - Rebuilt string table
-// 3. .dynsym      - Rebuilt symbol table
-// 4. .dynamic     - Header-only, points to PT_DYNAMIC
-// 5. .text        - Header-only, covers entire RX segment
-// 6. .data        - Header-only, covers entire RW segment
-// 7. .rela.dyn    - Header-only, points to original relocs (if present)
-// 8. .shstrtab    - New section names
 type ElfRebuilder struct {
-	reader *ElfReader
+	*ElfReader
+	OutFile *os.File
 
-	// Section data
-	sections     []Elf64_Shdr
-	sectionNames []string
-	sectionData  map[int][]byte
-
-	// Layout information
-	currentOffset uint64
-
-	// Section indices (minimal set)
-	dynstrSectionIdx   int
-	dynsymSectionIdx   int
-	dynamicSectionIdx  int
-	textSectionIdx     int
-	dataSectionIdx     int
-	relaSectionIdx     int
-	shstrtabSectionIdx int
-
-	// Section header string table
-	shstrtab    []byte
-	shstrtabMap map[string]uint32
+	sections       []Elf64_Shdr
+	shstrtab       []byte
+	sectionNameMap map[string]uint32
 }
 
-// NewElfRebuilder creates a new ELF rebuilder
-func NewElfRebuilder(reader *ElfReader) *ElfRebuilder {
-	return &ElfRebuilder{
-		reader:       reader,
-		sections:     make([]Elf64_Shdr, 0),
-		sectionNames: make([]string, 0),
-		sectionData:  make(map[int][]byte),
-		shstrtabMap:  make(map[string]uint32),
-		shstrtab:     []byte{0}, // Start with null byte
+func NewElfRebuilder(reader *ElfReader, outputPath string) (*ElfRebuilder, error) {
+	var rebuilder ElfRebuilder = ElfRebuilder{
+		ElfReader: reader,
+		OutFile:   nil,
+
+		sections:       make([]Elf64_Shdr, 0),
+		shstrtab:       []byte{0},
+		sectionNameMap: make(map[string]uint32),
 	}
+
+	var err error
+	rebuilder.OutFile, err = os.OpenFile(outputPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	return &rebuilder, nil
 }
 
-// addShstrtabString adds a string to the section header string table
-func (rb *ElfRebuilder) addShstrtabString(s string) uint32 {
-	if s == "" {
-		return 0
-	}
-	if offset, ok := rb.shstrtabMap[s]; ok {
-		return offset
-	}
-	offset := uint32(len(rb.shstrtab))
-	rb.shstrtab = append(rb.shstrtab, []byte(s)...)
-	rb.shstrtab = append(rb.shstrtab, 0)
-	rb.shstrtabMap[s] = offset
-	return offset
-}
+// WriteFixedElf copies the source file and writes fixed relocation values
+func (r *ElfRebuilder) WriteFixedElf() error {
+	r.copyInput()
 
-// rebuildDynamicSection creates a new dynamic section with corrected STRTAB offsets
-func (rb *ElfRebuilder) rebuildDynamicSection() []byte {
-	var newDyns []Elf64_Dyn
-
-	for _, dyn := range rb.reader.Dyns {
-		newDyn := dyn
-
-		// For string-referencing tags, resolve the old string and get new offset
-		switch dyn.Tag {
-		case DT_NEEDED, DT_SONAME, DT_RUNPATH:
-			oldStr := rb.reader.readString(uint32(dyn.Val))
-			if oldStr != "" {
-				if newOffset, ok := rb.reader.newStrtabMap[oldStr]; ok {
-					newDyn.Val = uint64(newOffset)
-				}
-			}
+	// Fix program headers - write normalized Vaddr values
+	phdrOffset := r.ElfHeader.PhdrOffset
+	for i, phdr := range r.Phdrs {
+		offset := phdrOffset + uint64(i)*uint64(r.ElfHeader.Phentsize)
+		// Write fixed Offset, Vaddr & Paddr at offset+8
+		if err := r.writeAtOffset(offset+8, phdr.Vaddr); err != nil {
+			return fmt.Errorf("failed to write phdr offset %d: %w", phdr.Vaddr, err)
+		}
+		if err := r.writeAtOffset(offset+16, phdr.Vaddr); err != nil {
+			return fmt.Errorf("failed to write phdr vaddr %d: %w", phdr.Vaddr, err)
+		}
+		if err := r.writeAtOffset(offset+24, phdr.Vaddr); err != nil {
+			return fmt.Errorf("failed to write phdr paddr %d: %w", phdr.Vaddr, err)
 		}
 
-		newDyns = append(newDyns, newDyn)
-	}
-
-	return makeBytes(newDyns)
-}
-
-// vaddrToOffset converts a virtual address to a file offset using PT_LOAD segments
-func (rb *ElfRebuilder) vaddrToOffset(vaddr uint64) uint64 {
-	for _, phdr := range rb.reader.Phdrs {
-		if phdr.Type == PT_LOAD {
-			if vaddr >= phdr.Vaddr && vaddr < phdr.Vaddr+phdr.Memsz {
-				return phdr.Offset + (vaddr - phdr.Vaddr)
-			}
+		// Write same value for Filesz & Memsz
+		size := max(phdr.Filesz, phdr.Memsz)
+		if err := r.writeAtOffset(offset+32, size); err != nil {
+			return fmt.Errorf("failed to write phdr filesz %d: %w", size, err)
 		}
+		if err := r.writeAtOffset(offset+40, size); err != nil {
+			return fmt.Errorf("failed to write phdr memsz %d: %w", size, err)
+		}
+		logger.Debug("write:phdr", "idx", i, "type", phdr.Type.Text(), "vaddr", phdr.Vaddr, "paddr", phdr.Vaddr, "filesz", size, "memsz", size)
 	}
-	return vaddr
+	logger.Info("write:phdrs", "count", len(r.Phdrs))
+
+	if err := r.writeFixedInitsFinis(); err != nil {
+		return fmt.Errorf("failed to write init/fini arrays: %w", err)
+	}
+
+	// Build and write relocs
+	if err := r.writeFixedRelocs(); err != nil {
+		return fmt.Errorf("failed to write relocs: %w", err)
+	}
+
+	// Build and write section headers
+	if err := r.writeSectionHeaders(); err != nil {
+		return fmt.Errorf("failed to write section headers: %w", err)
+	}
+
+	logger.Info("write:done")
+	return nil
 }
 
-// addSection adds a new section with custom data (placed at end of file)
-func (rb *ElfRebuilder) addSection(name string, shType SHT_Type, flags uint64, data []byte, link uint32, info uint32, addralign uint64, entsize uint64) int {
-	nameOffset := rb.addShstrtabString(name)
-
-	section := Elf64_Shdr{
-		Name:      nameOffset,
-		Type:      shType,
-		Flags:     flags,
-		Addr:      0, // No virtual address for rebuilt sections
-		Offset:    0, // Will be assigned later
-		Size:      uint64(len(data)),
-		Link:      link,
-		Info:      info,
-		Addralign: addralign,
-		Entsize:   entsize,
+func (r *ElfRebuilder) copyInput() error {
+	// Copy entire source file to output
+	_, err := r.File.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat source file: %w", err)
+	}
+	// Copy entire source file
+	if _, err := r.File.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek source: %w", err)
+	}
+	copied, err := io.Copy(r.OutFile, r.File)
+	if err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
 	}
 
-	idx := len(rb.sections)
-	rb.sections = append(rb.sections, section)
-	rb.sectionNames = append(rb.sectionNames, name)
-	if len(data) > 0 {
-		rb.sectionData[idx] = data
-	}
-
-	return idx
+	logger.Info("write:copied", "size", copied)
+	return nil
 }
 
-// addSectionHeader adds a section header pointing to existing PT_LOAD data
-func (rb *ElfRebuilder) addSectionHeader(name string, shType SHT_Type, flags uint64, addr uint64, size uint64, link uint32, info uint32, addralign uint64, entsize uint64) int {
-	nameOffset := rb.addShstrtabString(name)
-	fileOffset := rb.vaddrToOffset(addr)
-
+func (r *ElfRebuilder) addSection(name string, shType SHT_Type, flags uint64, addr uint64, size uint64, link uint32, info uint32, entsize uint64) int {
+	nameOffset := r.addSectionName(name)
 	section := Elf64_Shdr{
 		Name:      nameOffset,
 		Type:      shType,
 		Flags:     flags,
 		Addr:      addr,
-		Offset:    fileOffset,
+		Offset:    addr,
 		Size:      size,
 		Link:      link,
 		Info:      info,
-		Addralign: addralign,
+		Addralign: 8,
 		Entsize:   entsize,
 	}
-
-	idx := len(rb.sections)
-	rb.sections = append(rb.sections, section)
-	rb.sectionNames = append(rb.sectionNames, name)
-
+	idx := len(r.sections)
+	r.sections = append(r.sections, section)
 	return idx
 }
 
-// buildSections creates all necessary sections
-func (rb *ElfRebuilder) buildSections() error {
-	logger.Info("build:sections")
+func (r *ElfRebuilder) addSectionName(name string) uint32 {
+	if name == "" {
+		return 0
+	}
+	if offset, ok := r.sectionNameMap[name]; ok {
+		return offset
+	}
+	offset := uint32(len(r.shstrtab))
+	r.shstrtab = append(r.shstrtab, []byte(name)...)
+	r.shstrtab = append(r.shstrtab, 0)
+	r.sectionNameMap[name] = offset
+	return offset
+}
 
-	// 1. NULL section (required)
-	rb.addSection("", SHT_NULL, 0, nil, 0, 0, 0, 0)
+func (r *ElfRebuilder) readSectionName(nameOffset uint32) string {
+	for key, val := range r.sectionNameMap {
+		if val == nameOffset {
+			return key
+		}
+	}
+	return ""
+}
 
-	// 2. .dynstr - rebuilt string table
-	if len(rb.reader.newStrtab) > 0 {
-		rb.dynstrSectionIdx = rb.addSection(
-			".dynstr", SHT_STRTAB, SHF_ALLOC,
-			rb.reader.newStrtab,
-			0, 0, 1, 0,
-		)
-		logger.Info("section | .dynstr", "size", len(rb.reader.newStrtab))
+func (r *ElfRebuilder) writeSectionHeaders() error {
+	r.addSection("", SHT_NULL, 0, 0, 0, 0, 0, 0)
+
+	// Track section indices for link fields
+	var dynstrIdx, dynsymIdx int
+	// Track end of metadata to avoid overlap with .text
+	var maxMetadataEnd uint64 = 0
+
+	// Helper to track metadata end
+	trackMetadata := func(addr, size uint64) {
+		end := addr + size
+		if end > maxMetadataEnd {
+			maxMetadataEnd = end
+		}
 	}
 
-	// 3. .dynsym - rebuilt symbol table
-	if len(rb.reader.newSymbols) > 0 {
-		symData := makeBytes(rb.reader.newSymbols)
-		localCount := uint32(0)
-		for _, sym := range rb.reader.newSymbols {
-			if sym.stBind() == STB_LOCAL {
-				localCount++
+	// 1. .dynstr - dynamic string table
+	if r.strtabOffset != 0 && r.strtabSize != 0 {
+		dynstrIdx = r.addSection(".dynstr", SHT_STRTAB, SHF_ALLOC,
+			r.strtabOffset, r.strtabSize, 0, 0, 0)
+		trackMetadata(r.strtabOffset, r.strtabSize)
+	}
+
+	// 2. .dynsym - dynamic symbol table
+	if r.symtabOffset != 0 && r.symCount > 0 {
+		symSize := r.symCount * uint64(binary.Size(Elf64_Sym{}))
+		// sh_info = index of first non-local (GLOBAL/WEAK) symbol
+		firstGlobalIdx := uint32(1) // Default: skip null symbol
+		for i, sym := range r.Symbols {
+			if sym.stBind() != STB_LOCAL {
+				firstGlobalIdx = uint32(i)
+				break
 			}
 		}
-
-		rb.dynsymSectionIdx = rb.addSection(
-			".dynsym", SHT_DYNSYM, SHF_ALLOC,
-			symData,
-			uint32(rb.dynstrSectionIdx), localCount,
-			8, 24,
-		)
-		logger.Info("section | .dynsym", "count", len(rb.reader.newSymbols))
+		dynsymIdx = r.addSection(".dynsym", SHT_DYNSYM, SHF_ALLOC,
+			r.symtabOffset, symSize, uint32(dynstrIdx), firstGlobalIdx, 24)
+		trackMetadata(r.symtabOffset, symSize)
 	}
 
-	// 4. .dynamic - rebuilt with corrected string table offsets
-	if rb.reader.dynamicOffset != 0 && len(rb.reader.Dyns) > 0 {
-		dynData := rb.rebuildDynamicSection()
-		rb.dynamicSectionIdx = rb.addSection(
-			".dynamic", SHT_DYNAMIC, SHF_ALLOC|SHF_WRITE,
-			dynData,
-			uint32(rb.dynstrSectionIdx), 0,
-			8, 16,
-		)
-		logger.Info("section | .dynamic", "entries", len(rb.reader.Dyns), "size", len(dynData))
+	// 3. .hash
+	if r.hashOffset != 0 {
+		r.addSection(".hash", SHT_HASH, SHF_ALLOC,
+			r.hashOffset, r.hashSize, uint32(dynsymIdx), 0, 4)
+		trackMetadata(r.hashOffset, r.hashSize)
 	}
 
-	// 5. .text - entire executable segment
-	for _, phdr := range rb.reader.Phdrs {
+	// 4. .gnu.hash
+	if r.gnuHashOffset != 0 {
+		r.addSection(".gnu.hash", SHT_GNU_HASH, SHF_ALLOC,
+			r.gnuHashOffset, r.gnuHashSize, uint32(dynsymIdx), 0, 8)
+		trackMetadata(r.gnuHashOffset, r.gnuHashSize)
+	}
+
+	// 5. .gnu.version - version index array (2 bytes per symbol)
+	if r.versymOffset != 0 && r.symCount > 0 {
+		versymSize := r.symCount * 2 // uint16 per symbol
+		r.addSection(".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC,
+			r.versymOffset, versymSize, uint32(dynsymIdx), 0, 2)
+		trackMetadata(r.versymOffset, versymSize)
+	}
+
+	// 6. .gnu.version_r - version requirements
+	if r.verneedOffset != 0 && r.verneedSize > 0 {
+		r.addSection(".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC,
+			r.verneedOffset, r.verneedSize, uint32(dynstrIdx), uint32(r.verneedNum), 4)
+		trackMetadata(r.verneedOffset, r.verneedSize)
+	}
+
+	// 5. .rela.dyn or .rel.dyn
+	if r.relOffset != 0 && r.relSize > 0 {
+		r.addSection(".rel.dyn", SHT_REL, SHF_ALLOC,
+			r.relOffset, r.relSize, uint32(dynsymIdx), 0, 16)
+		trackMetadata(r.relOffset, r.relSize)
+	}
+	if r.relaOffset != 0 && r.relaSize > 0 {
+		r.addSection(".rela.dyn", SHT_RELA, SHF_ALLOC,
+			r.relaOffset, r.relaSize, uint32(dynsymIdx), 0, 24)
+		trackMetadata(r.relaOffset, r.relaSize)
+	}
+
+	// 6. .rel.plt or .rela.plt
+	if r.jmprelOffset != 0 && r.jmprelSize > 0 {
+		switch r.jmprelEntry {
+		case uint64(binary.Size(Elf64_Rel{})):
+			r.addSection(".rel.plt", SHT_REL, SHF_ALLOC|SHF_INFO_LINK,
+				r.jmprelOffset, r.jmprelSize, uint32(dynsymIdx), 0, 16)
+		case uint64(binary.Size(Elf64_Rela{})):
+			r.addSection(".rela.plt", SHT_RELA, SHF_ALLOC|SHF_INFO_LINK,
+				r.jmprelOffset, r.jmprelSize, uint32(dynsymIdx), 0, 24)
+		}
+		trackMetadata(r.jmprelOffset, r.jmprelSize)
+	}
+
+	// 7a. .init
+	if r.initOffset != 0 {
+		r.addSection(".init", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			r.initOffset, 8, 0, 0, 4)
+		trackMetadata(r.initOffset, 8)
+	}
+	// 7b. .fini
+	if r.finiOffset != 0 {
+		r.addSection(".fini", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			r.finiOffset, 8, 0, 0, 4)
+		trackMetadata(r.finiOffset, 8)
+	}
+
+	// 8. .plt - Procedure Linkage Table
+	// Calculated from .rela.plt entries
+	if r.jmprelSize > 0 && r.jmprelEntry > 0 {
+		count := r.jmprelSize / r.jmprelEntry
+		pltSize := uint64(32) + count*16 // 32 byte header + 16 bytes per entry
+		pltStart := AlignUp(maxMetadataEnd, 16)
+
+		r.addSection(".plt", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			pltStart, pltSize, 0, 0, 16)
+		trackMetadata(pltStart, pltSize)
+	}
+
+	// 9. .dynamic
+	if r.dynamicAddr != 0 && r.dynamicSize > 0 {
+		r.addSection(".dynamic", SHT_DYNAMIC, SHF_ALLOC|SHF_WRITE,
+			r.dynamicOffset, r.dynamicSize, uint32(dynstrIdx), 0, 16)
+	}
+
+	// 10. .got
+	if r.gotOffset != 0 && r.gotSize > 0 {
+		r.addSection(".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+			r.gotOffset, r.gotSize, 0, 0, 8)
+	}
+
+	// 11. .got.plt (DT_PLTGOT)
+	if r.pltGotOffset != 0 && r.pltGotSize > 0 {
+		r.addSection(".got.plt", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+			r.pltGotOffset, r.pltGotSize, 0, 0, 8)
+	}
+
+	// 12. .init_array
+	if r.initArrayOffset != 0 && r.initArraySize > 0 {
+		r.addSection(".init_array", SHT_INIT_ARRAY, SHF_ALLOC|SHF_WRITE,
+			r.initArrayOffset, r.initArraySize, 0, 0, 8)
+	}
+
+	// 13. .fini_array
+	if r.finiArrayOffset != 0 && r.finiArraySize > 0 {
+		r.addSection(".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE,
+			r.finiArrayOffset, r.finiArraySize, 0, 0, 8)
+	}
+
+	// 14. .text - find from PT_LOAD with R+X flags
+	for _, phdr := range r.Phdrs {
 		if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 && (phdr.Flags&PF_R) != 0 {
-			// Skip ELF headers if segment starts at 0
 			addr := phdr.Vaddr
 			size := phdr.Memsz
-			if addr == 0 {
-				headerSize := uint64(rb.reader.ElfHeader.Ehsize) + uint64(rb.reader.ElfHeader.Phnum)*uint64(rb.reader.ElfHeader.Phentsize)
-				headerSize = alignUp(headerSize, 16)
-				addr += headerSize
-				size -= headerSize
+
+			// Adjust start to avoid overlapping with metadata/headers
+			minStart := AlignUp(maxMetadataEnd, 4)
+			if minStart > addr {
+				diff := minStart - addr
+				if diff < size {
+					addr = minStart
+					size -= diff
+				} else {
+					// Should not happen if filtered correctly
+					size = 0
+				}
 			}
 
-			rb.textSectionIdx = rb.addSectionHeader(
-				".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
-				addr, size,
-				0, 0, 16, 0,
-			)
-			logger.Info("section | .text", "addr", fmt.Sprintf("0x%x", addr), "size", size)
-			break // Only first executable segment
+			if size > 0 {
+				r.addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+					addr, size, 0, 0, 0)
+			}
+			break
 		}
 	}
 
-	// 6. .data - entire writable segment
-	for _, phdr := range rb.reader.Phdrs {
+	// 11. .data - find from PT_LOAD with R+W flags (non-executable)
+	dataStart := uint64(0xffffffffffffffff)
+	dataEnd := uint64(0)
+	for _, phdr := range r.Phdrs {
 		if phdr.Type == PT_LOAD && (phdr.Flags&PF_W) != 0 && (phdr.Flags&PF_X) == 0 {
-			addr := phdr.Vaddr
-			size := phdr.Memsz // Use Memsz to include BSS
-
-			rb.dataSectionIdx = rb.addSectionHeader(
-				".data", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
-				addr, size,
-				0, 0, 16, 0,
-			)
-			logger.Info("section | .data", "addr", fmt.Sprintf("0x%x", addr), "size", size)
-			break // Only first writable segment
+			dataStart = min(dataStart, phdr.Vaddr)
+			dataEnd = max(dataEnd, phdr.Vaddr+phdr.Filesz, phdr.Vaddr+phdr.Memsz)
 		}
 	}
+	if dataEnd != 0 {
+		r.addSection(".data", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+			dataStart, dataEnd-dataStart, 0, 0, 0)
 
-	// 7. .rela.dyn - header-only (if present)
-	if rb.reader.relaOffset != 0 && rb.reader.relaSize > 0 {
-		rb.relaSectionIdx = rb.addSectionHeader(
-			".rela.dyn", SHT_RELA, SHF_ALLOC,
-			rb.reader.relaOffset, rb.reader.relaSize,
-			uint32(rb.dynsymSectionIdx), 0,
-			8, 24,
-		)
-		logger.Info("section | .rela.dyn", "addr", fmt.Sprintf("0x%x", rb.reader.relaOffset))
-	} else if rb.reader.relOffset != 0 && rb.reader.relSize > 0 {
-		rb.relaSectionIdx = rb.addSectionHeader(
-			".rel.dyn", SHT_REL, SHF_ALLOC,
-			rb.reader.relOffset, rb.reader.relSize,
-			uint32(rb.dynsymSectionIdx), 0,
-			8, 16,
-		)
-		logger.Info("section | .rel.dyn", "addr", fmt.Sprintf("0x%x", rb.reader.relOffset))
 	}
 
-	// 8. .init_array - constructor pointers (if present)
-	if rb.reader.initArrayOffset != 0 && rb.reader.initArraySize > 0 {
-		rb.addSectionHeader(
-			".init_array", SHT_INIT_ARRAY, SHF_ALLOC|SHF_WRITE,
-			rb.reader.initArrayOffset, rb.reader.initArraySize,
-			0, 0, 8, 8,
-		)
-		logger.Info("section | .init_array", "addr", fmt.Sprintf("0x%x", rb.reader.initArrayOffset), "size", rb.reader.initArraySize)
+	// 12. .shstrtab - add name, will set offset later
+	r.addSectionName(".shstrtab")
+	shstrtabIdx := r.addSection(".shstrtab", SHT_STRTAB, 0, 0, uint64(len(r.shstrtab)), 0, 0, 0)
+
+	// Calculate where to write (end of file)
+	fileInfo, err := r.OutFile.Stat()
+	if err != nil {
+		return err
+	}
+	shstrtabOffset := AlignUp(uint64(fileInfo.Size()), 8)
+	shdrOffset := AlignUp(shstrtabOffset+uint64(len(r.shstrtab)), 8)
+
+	// Update .shstrtab offset
+	ss := &r.sections[shstrtabIdx]
+	ss.Addr = shstrtabOffset
+	ss.Offset = shstrtabOffset
+
+	// Write .shstrtab data to file
+	if _, err := r.OutFile.Seek(int64(shstrtabOffset), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to shstrtab: %w", err)
+	}
+	if _, err := r.OutFile.Write(r.shstrtab); err != nil {
+		return fmt.Errorf("failed to write shstrtab: %w", err)
 	}
 
-	// 9. .fini_array - destructor pointers (if present)
-	if rb.reader.finiArrayOffset != 0 && rb.reader.finiArraySize > 0 {
-		rb.addSectionHeader(
-			".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE,
-			rb.reader.finiArrayOffset, rb.reader.finiArraySize,
-			0, 0, 8, 8,
-		)
-		logger.Info("section | .fini_array", "addr", fmt.Sprintf("0x%x", rb.reader.finiArrayOffset), "size", rb.reader.finiArraySize)
-	}
-
-	// 10. .shstrtab - section names
-	rb.addShstrtabString(".shstrtab")
-	rb.shstrtabSectionIdx = rb.addSection(
-		".shstrtab", SHT_STRTAB, 0,
-		rb.shstrtab,
-		0, 0, 1, 0,
-	)
-
-	logger.Info("build:done", "count", len(rb.sections))
-	return nil
-}
-
-// calculateLayout determines file offsets for all sections
-func (rb *ElfRebuilder) calculateLayout() error {
-	logger.Info("layout:calc")
-
-	// Find where PT_LOAD segments end
-	maxSegmentEnd := uint64(0)
-	for _, phdr := range rb.reader.Phdrs {
-		if phdr.Type == PT_LOAD {
-			segmentEnd := phdr.Offset + phdr.Filesz
-			if segmentEnd > maxSegmentEnd {
-				maxSegmentEnd = segmentEnd
-			}
+	// Write section headers
+	for i, section := range r.sections {
+		offset := shdrOffset + uint64(i)*uint64(binary.Size(Elf64_Shdr{}))
+		if err := r.writeAtOffset(offset, &section); err != nil {
+			return err
 		}
+		logger.Debug("write:section", "idx", i, "addr", section.Addr, "size", section.Size, "name", r.readSectionName(section.Name))
 	}
 
-	// Place rebuilt sections after segment data, aligned to 8 bytes
-	rb.currentOffset = alignUp(maxSegmentEnd, 8)
-
-	for i := range rb.sections {
-		if rb.sections[i].Type == SHT_NULL {
-			continue
-		}
-
-		// Skip sections that already have offsets (header-only sections)
-		if rb.sections[i].Offset != 0 {
-			continue
-		}
-
-		// Align and assign offset
-		if rb.sections[i].Addralign > 0 {
-			rb.currentOffset = alignUp(rb.currentOffset, rb.sections[i].Addralign)
-		}
-
-		rb.sections[i].Offset = rb.currentOffset
-		rb.currentOffset += rb.sections[i].Size
+	// e_shoff at offset 40 (8 bytes)
+	if err := r.writeAtOffset(40, shdrOffset); err != nil {
+		return err
 	}
+	// e_shnum at offset 60 (2 bytes)
+	eShNum := uint16(len(r.sections))
+	if err := r.writeAtOffset(60, eShNum); err != nil {
+		return err
+	}
+	// e_shstrndx at offset 62 (2 bytes)
+	eShStrNdx := uint16(shstrtabIdx)
+	if err := r.writeAtOffset(62, eShStrNdx); err != nil {
+		return err
+	}
+	logger.Info("write:ehdr", "e_shoff", shdrOffset, "e_shnum", eShNum, "e_shstrndx", eShStrNdx)
 
-	// Section header table goes at the very end
-	rb.currentOffset = alignUp(rb.currentOffset, 8)
-	logger.Info("shdr:offset", "offset", fmt.Sprintf("0x%x", rb.currentOffset))
+	// Fix symbol section indices
+	fixedSyms := r.fixSymbolSectionIndices()
+	if fixedSyms > 0 {
+		if err := r.writeSymbolShndx(); err != nil {
+			return fmt.Errorf("failed to fix symbol shndx: %w", err)
+		}
+		logger.Info("write:syms", "count", fixedSyms)
+	}
 
 	return nil
 }
 
-func makeBytes[T any](data []T) []byte {
-	if len(data) == 0 {
-		return []byte{}
-	}
-	var buf bytes.Buffer
-	for _, item := range data {
-		if err := binary.Write(&buf, binary.LittleEndian, item); err != nil {
-			logger.Error("Failed to encode item", "err", err)
-			return []byte{}
+// fixSymbolSectionIndices determines correct section indices for symbols
+func (r *ElfRebuilder) fixSymbolSectionIndices() int {
+	fixed := 0
+	for i := range r.Symbols {
+		sym := &r.Symbols[i]
+		if sym.St_Value == 0 || sym.St_Shndx == 0 {
+			continue
+		}
+		// Skip special section indices
+		if sym.St_Shndx >= 0xff00 {
+			continue
+		}
+		newShndx := r.findSectionForAddr(sym.St_Value)
+		if newShndx != sym.St_Shndx && newShndx != 0 {
+			sym.St_Shndx = newShndx
+			fixed++
 		}
 	}
-	return buf.Bytes()
+	return fixed
 }
 
-// writeRelocations writes the rebuilt ELF file
-func (rb *ElfRebuilder) writeRelocations(file *os.File) error {
-	logger.Info("write:start")
-
-	// Build sections
-	if err := rb.buildSections(); err != nil {
-		return fmt.Errorf("failed to build sections: %w", err)
-	}
-
-	// Expand PT_LOAD segments to include BSS for memory dumps
-	for i := range rb.reader.Phdrs {
-		if rb.reader.Phdrs[i].Type == PT_LOAD {
-			if rb.reader.Phdrs[i].Filesz < rb.reader.Phdrs[i].Memsz {
-				logger.Info("segment:expand", "segment", i,
-					"old_filesz", rb.reader.Phdrs[i].Filesz,
-					"new_filesz", rb.reader.Phdrs[i].Memsz)
-				rb.reader.Phdrs[i].Filesz = rb.reader.Phdrs[i].Memsz
-			}
+// findSectionForAddr finds the section index that contains the given address
+func (r *ElfRebuilder) findSectionForAddr(addr uint64) uint16 {
+	for i, sec := range r.sections {
+		if sec.Type == SHT_NULL || sec.Addr == 0 {
+			continue
+		}
+		if addr >= sec.Addr && addr < sec.Addr+sec.Size {
+			return uint16(i)
 		}
 	}
+	return 0 // SHN_UNDEF
+}
 
-	// Calculate layout
-	if err := rb.calculateLayout(); err != nil {
-		return fmt.Errorf("failed to calculate layout: %w", err)
-	}
+// writeSymbolShndx writes the fixed st_shndx values to the symbol table
+func (r *ElfRebuilder) writeSymbolShndx() error {
+	symEntrySize := uint64(binary.Size(Elf64_Sym{}))
+	shndxOffset := uint64(6) // offset of st_shndx within Elf64_Sym
 
-	// Update ELF header
-	newHeader := *rb.reader.ElfHeader
-	newHeader.ShdrOffset = rb.currentOffset
-	newHeader.Shnum = uint16(len(rb.sections))
-	newHeader.Shstrndx = uint16(rb.shstrtabSectionIdx)
-
-	// Write ELF header
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to start: %w", err)
-	}
-	if err := binary.Write(file, binary.LittleEndian, newHeader); err != nil {
-		return fmt.Errorf("failed to write ELF header: %w", err)
-	}
-	logger.Info("write:ehdr")
-
-	// Write program headers
-	if _, err := file.Seek(int64(newHeader.PhdrOffset), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to program headers: %w", err)
-	}
-	if err := binary.Write(file, binary.LittleEndian, rb.reader.Phdrs); err != nil {
-		return fmt.Errorf("failed to write program headers: %w", err)
-	}
-	logger.Info("write:phdr")
-
-	// Get source file size
-	var fileSize uint64
-	if stat, err := rb.reader.File.Stat(); err == nil {
-		fileSize = uint64(stat.Size())
-	} else {
-		return fmt.Errorf("failed to stat source file: %w", err)
-	}
-
-	// Copy PT_LOAD segment data from memory dump
-	for i, phdr := range rb.reader.Phdrs {
-		if phdr.Type == PT_LOAD && phdr.Filesz > 0 {
-			srcOffset := phdr.Vaddr
-			dstOffset := phdr.Offset
-			copySize := phdr.Filesz
-
-			// Skip headers if segment starts at 0
-			if phdr.Offset == 0 {
-				headerSize := uint64(rb.reader.ElfHeader.Ehsize) + uint64(rb.reader.ElfHeader.Phnum)*uint64(rb.reader.ElfHeader.Phentsize)
-				srcOffset += headerSize
-				dstOffset = headerSize
-				copySize = phdr.Filesz - headerSize
-			}
-
-			if copySize == 0 {
-				continue
-			}
-
-			// Truncate if source is too small
-			if srcOffset+copySize > fileSize {
-				copySize = uint64(max(int64(fileSize)-int64(srcOffset), 0))
-			}
-
-			// Read from memory dump
-			segmentData := make([]byte, copySize)
-			if _, err := rb.reader.File.Seek(int64(srcOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek for segment %d: %w", i, err)
-			}
-			if _, err := io.ReadFull(rb.reader.File, segmentData); err != nil {
-				return fmt.Errorf("failed to read segment %d: %w", i, err)
-			}
-
-			// Write to output
-			if _, err := file.Seek(int64(dstOffset), io.SeekStart); err != nil {
-				return fmt.Errorf("failed to seek for output segment %d: %w", i, err)
-			}
-			if _, err := file.Write(segmentData); err != nil {
-				return fmt.Errorf("failed to write segment %d: %w", i, err)
-			}
+	for i, sym := range r.Symbols {
+		if sym.St_Value == 0 || sym.St_Shndx == 0 {
+			continue
 		}
-	}
-	logger.Info("write:segments")
-
-	// Write rebuilt section data
-	for i, section := range rb.sections {
-		if section.Type == SHT_NULL || section.Size == 0 {
+		// Skip special section indices
+		if sym.St_Shndx >= 0xff00 {
 			continue
 		}
 
-		data, ok := rb.sectionData[i]
-		if !ok {
-			continue
-		}
-
-		if _, err := file.Seek(int64(section.Offset), io.SeekStart); err != nil {
-			return fmt.Errorf("failed to seek to section %s: %w", rb.sectionNames[i], err)
-		}
-		if _, err := file.Write(data); err != nil {
-			return fmt.Errorf("failed to write section %s: %w", rb.sectionNames[i], err)
-		}
-
-		logger.Info("write:section", "name", rb.sectionNames[i], "offset", fmt.Sprintf("0x%x", section.Offset))
-	}
-
-	// Write section header table
-	if _, err := file.Seek(int64(newHeader.ShdrOffset), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to section headers: %w", err)
-	}
-	for _, section := range rb.sections {
-		if err := binary.Write(file, binary.LittleEndian, &section); err != nil {
-			return fmt.Errorf("failed to write section header: %w", err)
+		offset := r.symtabOffset + uint64(i)*symEntrySize + shndxOffset
+		if err := r.writeAtOffset(offset, sym.St_Shndx); err != nil {
+			return err
 		}
 	}
-	logger.Info("write:shdr")
-
-	logger.Info("done", "path", file.Name())
 	return nil
+}
+
+// writeFixedInitsFinis writes addresses for init_array & finit_array
+func (r *ElfRebuilder) writeFixedInitsFinis() error {
+	if r.initOffset != 0 {
+		value := r.readUint64At(r.initOffset)
+		if value > r.BaseAddr {
+			newVal := value - r.BaseAddr
+			if err := r.writeAtOffset(r.initOffset, newVal); err != nil {
+				return fmt.Errorf("failed to write init: %w", err)
+			}
+			logger.Debug("write:init", "offset", r.initOffset, "val", fmt.Sprintf("0x%x", newVal))
+		} else {
+			logger.Debug("pass:init", "offset", r.initOffset, "val", fmt.Sprintf("0x%x", value))
+		}
+	}
+
+	if r.finiOffset != 0 {
+		value := r.readUint64At(r.finiOffset)
+		if value > r.BaseAddr {
+			newVal := value - r.BaseAddr
+			if err := r.writeAtOffset(r.finiOffset, newVal); err != nil {
+				return fmt.Errorf("failed to write fini: %w", err)
+			}
+			logger.Debug("write:fini", "offset", r.finiOffset, "val", fmt.Sprintf("0x%x", newVal))
+		} else {
+			logger.Debug("pass:fini", "offset", r.finiOffset, "val", fmt.Sprintf("0x%x", value))
+		}
+	}
+
+	if r.initArraySize > 0 && r.initArrayOffset != 0 {
+		initArrayCount := r.initArraySize / 8
+		for i := range initArrayCount {
+			offset := r.initArrayOffset + uint64(i)*8
+			value := r.readUint64At(offset)
+			if value > r.BaseAddr {
+				newVal := value - r.BaseAddr
+				if err := r.writeAtOffset(offset, newVal); err != nil {
+					return fmt.Errorf("failed to write init_array: %w", err)
+				}
+				logger.Debug("write:init_array", "offset", offset, "val", fmt.Sprintf("0x%x", newVal))
+			} else {
+				logger.Debug("pass:init_array", "offset", offset, "val", fmt.Sprintf("0x%x", value))
+			}
+		}
+		logger.Info("write:init_array", "count", initArrayCount)
+	}
+
+	if r.finiArraySize > 0 && r.finiArrayOffset != 0 {
+		finiArrayCount := r.finiArraySize / 8
+		for i := range finiArrayCount {
+			offset := r.finiArrayOffset + uint64(i)*8
+			value := r.readUint64At(offset)
+			if value > r.BaseAddr {
+				newVal := value - r.BaseAddr
+				if err := r.writeAtOffset(offset, newVal); err != nil {
+					return fmt.Errorf("failed to write fini_array: %w", err)
+				}
+				logger.Debug("write:fini_array", "offset", offset, "val", fmt.Sprintf("0x%x", newVal))
+			} else {
+				logger.Debug("pass:fini_array", "offset", offset, "val", fmt.Sprintf("0x%x", value))
+			}
+		}
+		logger.Info("write:fini_array", "count", finiArrayCount)
+	}
+
+	return nil
+}
+
+// writeFixedRelocs writes REL, RELA & JMPREL(A)
+func (r *ElfRebuilder) writeFixedRelocs() error {
+	// Fix REL relocations - write to target locations
+	for i, rel := range r.Rel {
+		// Target location is rel.Offset (already normalized)
+		targetOffset := rel.Offset
+		fixedVal := r.computeRelValue(&rel)
+		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
+			return fmt.Errorf("failed to write rel: %w", err)
+		}
+		logger.Debug("write:rel", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
+	}
+	if len(r.Rel) > 0 {
+		logger.Info("write:rel", "count", len(r.Rel))
+	}
+
+	// Fix RELA relocations - write to target locations
+	for i, rela := range r.Rela {
+		// Target location is rela.Offset (already normalized)
+		targetOffset := rela.Offset
+		fixedVal := r.computeRelaValue(&rela)
+		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
+			return fmt.Errorf("failed to write rela: %w", err)
+		}
+		logger.Debug("write:rela", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
+	}
+	if len(r.Rela) > 0 {
+		logger.Info("write:rela", "count", len(r.Rela))
+	}
+
+	// Fix JmpRel relocations - write to target locations
+	for i, rel := range r.JmpRel {
+		targetOffset := rel.Offset
+		fixedVal := r.computeRelValue(&rel)
+		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
+			return fmt.Errorf("failed to write jmprel: %w", err)
+		}
+		logger.Debug("write:jmprel", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
+	}
+	if len(r.JmpRel) > 0 {
+		logger.Info("write:jmprel", "count", len(r.JmpRel))
+	}
+
+	// Fix JmpRela relocations - write to target locations
+	for i, rela := range r.JmpRela {
+		targetOffset := rela.Offset
+		fixedVal := r.computeRelaValue(&rela)
+		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
+			return fmt.Errorf("failed to write jmprela: %w", err)
+		}
+		logger.Debug("write:jmprela", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
+	}
+	if len(r.JmpRela) > 0 {
+		logger.Info("write:jmprela", "count", len(r.JmpRela))
+	}
+
+	logger.Info("write:relocs", "count", len(r.Rel)+len(r.Rela)+len(r.JmpRel)+len(r.JmpRela))
+
+	return nil
+}
+
+// computeRelValue computes the fixed value for a REL relocation
+func (r *ElfRebuilder) computeRelValue(rel *Elf64_Rel) uint64 {
+	relocType := rel.Type()
+	relocSym := rel.Sym()
+
+	var S uint64
+	if relocSym < uint32(len(r.Symbols)) {
+		sym := r.Symbols[relocSym]
+		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
+		logger.Debug("resolve:rel", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		S = sym.St_Value
+	}
+
+	fileOffset := rel.Offset
+
+	switch relocType {
+	case R_AARCH64_NONE:
+		return 0
+	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT:
+		return S
+	case R_AARCH64_RELATIVE:
+		// For RELATIVE: the stored value is base + original, we need original
+		currentVal := r.readUint64At(fileOffset)
+		return currentVal - r.BaseAddr
+	case R_AARCH64_TLS_DTPMOD:
+		return 1 // Module ID for same module
+	case R_AARCH64_TLS_DTPREL:
+		return S // TLS offset
+	default:
+		return S
+	}
+}
+
+// computeRelaValue computes the fixed value for a RELA relocation
+func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela) uint64 {
+	relocType := rela.Type()
+	relocSym := rela.Sym()
+
+	// Keep S as int64 for proper signed arithmetic with addend
+	var S int64
+	if relocSym < uint32(len(r.Symbols)) {
+		sym := r.Symbols[relocSym]
+		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
+		logger.Debug("resolve:rela", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		S = int64(sym.St_Value)
+	}
+
+	A := rela.Addend // Keep as int64
+	// rela.Offset is already normalized (relative offset, not absolute address)
+	fileOffset := rela.Offset
+
+	switch relocType {
+	case R_AARCH64_NONE:
+		return uint64(A)
+	case R_AARCH64_RELATIVE:
+		// For memory dumps: location contains (BaseAddr + A), read and subtract base
+		currentVal := r.readUint64At(fileOffset)
+		return currentVal - r.BaseAddr
+	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT:
+		return uint64(S + A)
+	case R_AARCH64_ABS64:
+		return uint64(S + A)
+	case R_AARCH64_PREL64:
+		// L = location address for PC-relative
+		L := int64(fileOffset)
+		return uint64(S + A - L)
+	case R_AARCH64_TLS_DTPMOD:
+		return 1 // Module ID for same module
+	case R_AARCH64_TLS_DTPREL:
+		return uint64(S + A) // TLS offset
+	default:
+		return uint64(S + A)
+	}
+}
+
+// writeUint64At writes a uint64 value at the specified offset
+func (r *ElfRebuilder) writeAtOffset(offset uint64, value any) error {
+	if _, err := r.OutFile.Seek(int64(offset), io.SeekStart); err != nil {
+		return err
+	}
+	return binary.Write(r.OutFile, binary.LittleEndian, value)
 }

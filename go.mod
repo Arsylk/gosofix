@@ -5,6 +5,7 @@ go 1.25.3
 require (
 	github.com/charmbracelet/lipgloss v1.0.0
 	github.com/charmbracelet/log v0.4.0
+	github.com/ianlancetaylor/demangle v0.0.0-20251118225945-96ee0021ea0f
 )
 
 require (
