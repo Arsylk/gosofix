@@ -15,11 +15,12 @@ import (
 var (
 	// Logger instance with custom styles
 	logger *log.Logger
+	styles *log.Styles
 )
 
 func init() {
 	// Create custom styles for the logger - minimalist machine-like format
-	styles := log.DefaultStyles()
+	styles = log.DefaultStyles()
 
 	// Symbolic prefixes with strict color coding
 	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
@@ -73,19 +74,21 @@ func init() {
 }
 
 // FixELFHeaders attempts to fix common issues with ELF headers.
-func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bool, verbose bool) error {
-	if debug {
-		logger.SetLevel(log.DebugLevel)
-	} else if verbose {
-		logger.SetLevel(log.InfoLevel)
-	} else {
+// verbosity: 0=quiet (warn only), 1=info, 2+=debug
+func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosity int) (error, string) {
+	switch verbosity {
+	case 0:
 		logger.SetLevel(log.WarnLevel)
+	case 1:
+		logger.SetLevel(log.InfoLevel)
+	default:
+		logger.SetLevel(log.DebugLevel)
 	}
 	logger.Info("elf:fix", "file", filePath, "base", baseAddr)
 
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err), ""
 	}
 	defer file.Close()
 
@@ -97,22 +100,24 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, debug bo
 
 	err = reader.Read()
 	if err != nil {
-		return err
+		return err, ""
 	}
 
 	rebuilder, err := NewElfRebuilder(&reader, outputPath)
 	if err != nil {
-		return fmt.Errorf("failed to create rebuilder: %w", err)
+		return fmt.Errorf("failed to create rebuilder: %w", err), ""
 	}
 
 	err = rebuilder.WriteFixedElf()
 	if err != nil {
-		return err
+		logger.Error("elf:fin", "err", err, "outpath", outputPath)
+		return err, ""
 	}
+	logger.Info("elf:fin success", "outpath", outputPath)
 
-	return nil
+	successMsg := styles.Message.Render("elf:fin", "outpath", outputPath)
+	return nil, successMsg
 }
-
 
 // readArray reads up to 'count' elements of type T from file at the given offset.
 // Returns the successfully read elements and the actual count. On EOF, returns partial results without error.
@@ -153,4 +158,5 @@ func readArray[T any](file *os.File, offset uint64, count uint64, name string) (
 	}
 
 	return result, nil
+
 }

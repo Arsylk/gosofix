@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 )
 
 type ElfRebuilder struct {
@@ -148,7 +149,7 @@ func (r *ElfRebuilder) readSectionName(nameOffset uint32) string {
 func (r *ElfRebuilder) writeSectionHeaders() error {
 	r.addSection("", SHT_NULL, 0, 0, 0, 0, 0, 0)
 
-	// Track section indices for link fields
+	// Track indices for link fields
 	var dynstrIdx, dynsymIdx int
 	// Track end of metadata to avoid overlap with .text
 	var maxMetadataEnd uint64 = 0
@@ -161,10 +162,22 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		}
 	}
 
+	type sectionInfo struct {
+		name    string
+		shType  SHT_Type
+		flags   uint64
+		addr    uint64
+		size    uint64
+		link    uint32
+		info    uint32
+		entsize uint64
+	}
+	var pendingSections []sectionInfo
+
 	// 1. .dynstr - dynamic string table
 	if r.strtabOffset != 0 && r.strtabSize != 0 {
-		dynstrIdx = r.addSection(".dynstr", SHT_STRTAB, SHF_ALLOC,
-			r.strtabOffset, r.strtabSize, 0, 0, 0)
+		pendingSections = append(pendingSections, sectionInfo{".dynstr", SHT_STRTAB, SHF_ALLOC,
+			r.strtabOffset, r.strtabSize, 0, 0, 0})
 		trackMetadata(r.strtabOffset, r.strtabSize)
 	}
 
@@ -179,49 +192,49 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 				break
 			}
 		}
-		dynsymIdx = r.addSection(".dynsym", SHT_DYNSYM, SHF_ALLOC,
-			r.symtabOffset, symSize, uint32(dynstrIdx), firstGlobalIdx, 24)
+		pendingSections = append(pendingSections, sectionInfo{".dynsym", SHT_DYNSYM, SHF_ALLOC,
+			r.symtabOffset, symSize, 0, firstGlobalIdx, 24})
 		trackMetadata(r.symtabOffset, symSize)
 	}
 
 	// 3. .hash
 	if r.hashOffset != 0 {
-		r.addSection(".hash", SHT_HASH, SHF_ALLOC,
-			r.hashOffset, r.hashSize, uint32(dynsymIdx), 0, 4)
+		pendingSections = append(pendingSections, sectionInfo{".hash", SHT_HASH, SHF_ALLOC,
+			r.hashOffset, r.hashSize, 0, 0, 4})
 		trackMetadata(r.hashOffset, r.hashSize)
 	}
 
 	// 4. .gnu.hash
 	if r.gnuHashOffset != 0 {
-		r.addSection(".gnu.hash", SHT_GNU_HASH, SHF_ALLOC,
-			r.gnuHashOffset, r.gnuHashSize, uint32(dynsymIdx), 0, 8)
+		pendingSections = append(pendingSections, sectionInfo{".gnu.hash", SHT_GNU_HASH, SHF_ALLOC,
+			r.gnuHashOffset, r.gnuHashSize, 0, 0, 8})
 		trackMetadata(r.gnuHashOffset, r.gnuHashSize)
 	}
 
 	// 5. .gnu.version - version index array (2 bytes per symbol)
 	if r.versymOffset != 0 && r.symCount > 0 {
 		versymSize := r.symCount * 2 // uint16 per symbol
-		r.addSection(".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC,
-			r.versymOffset, versymSize, uint32(dynsymIdx), 0, 2)
+		pendingSections = append(pendingSections, sectionInfo{".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC,
+			r.versymOffset, versymSize, 0, 0, 2})
 		trackMetadata(r.versymOffset, versymSize)
 	}
 
 	// 6. .gnu.version_r - version requirements
 	if r.verneedOffset != 0 && r.verneedSize > 0 {
-		r.addSection(".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC,
-			r.verneedOffset, r.verneedSize, uint32(dynstrIdx), uint32(r.verneedNum), 4)
+		pendingSections = append(pendingSections, sectionInfo{".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC,
+			r.verneedOffset, r.verneedSize, 0, uint32(r.verneedNum), 4})
 		trackMetadata(r.verneedOffset, r.verneedSize)
 	}
 
 	// 5. .rela.dyn or .rel.dyn
 	if r.relOffset != 0 && r.relSize > 0 {
-		r.addSection(".rel.dyn", SHT_REL, SHF_ALLOC,
-			r.relOffset, r.relSize, uint32(dynsymIdx), 0, 16)
+		pendingSections = append(pendingSections, sectionInfo{".rel.dyn", SHT_REL, SHF_ALLOC,
+			r.relOffset, r.relSize, 0, 0, 16})
 		trackMetadata(r.relOffset, r.relSize)
 	}
 	if r.relaOffset != 0 && r.relaSize > 0 {
-		r.addSection(".rela.dyn", SHT_RELA, SHF_ALLOC,
-			r.relaOffset, r.relaSize, uint32(dynsymIdx), 0, 24)
+		pendingSections = append(pendingSections, sectionInfo{".rela.dyn", SHT_RELA, SHF_ALLOC,
+			r.relaOffset, r.relaSize, 0, 0, 24})
 		trackMetadata(r.relaOffset, r.relaSize)
 	}
 
@@ -229,25 +242,25 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	if r.jmprelOffset != 0 && r.jmprelSize > 0 {
 		switch r.jmprelEntry {
 		case uint64(binary.Size(Elf64_Rel{})):
-			r.addSection(".rel.plt", SHT_REL, SHF_ALLOC|SHF_INFO_LINK,
-				r.jmprelOffset, r.jmprelSize, uint32(dynsymIdx), 0, 16)
+			pendingSections = append(pendingSections, sectionInfo{".rel.plt", SHT_REL, SHF_ALLOC|SHF_INFO_LINK,
+				r.jmprelOffset, r.jmprelSize, 0, 0, 16})
 		case uint64(binary.Size(Elf64_Rela{})):
-			r.addSection(".rela.plt", SHT_RELA, SHF_ALLOC|SHF_INFO_LINK,
-				r.jmprelOffset, r.jmprelSize, uint32(dynsymIdx), 0, 24)
+			pendingSections = append(pendingSections, sectionInfo{".rela.plt", SHT_RELA, SHF_ALLOC|SHF_INFO_LINK,
+				r.jmprelOffset, r.jmprelSize, 0, 0, 24})
 		}
 		trackMetadata(r.jmprelOffset, r.jmprelSize)
 	}
 
 	// 7a. .init
 	if r.initOffset != 0 {
-		r.addSection(".init", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
-			r.initOffset, 8, 0, 0, 4)
+		pendingSections = append(pendingSections, sectionInfo{".init", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			r.initOffset, 8, 0, 0, 4})
 		trackMetadata(r.initOffset, 8)
 	}
 	// 7b. .fini
 	if r.finiOffset != 0 {
-		r.addSection(".fini", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
-			r.finiOffset, 8, 0, 0, 4)
+		pendingSections = append(pendingSections, sectionInfo{".fini", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			r.finiOffset, 8, 0, 0, 4})
 		trackMetadata(r.finiOffset, 8)
 	}
 
@@ -258,39 +271,39 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		pltSize := uint64(32) + count*16 // 32 byte header + 16 bytes per entry
 		pltStart := AlignUp(maxMetadataEnd, 16)
 
-		r.addSection(".plt", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
-			pltStart, pltSize, 0, 0, 16)
+		pendingSections = append(pendingSections, sectionInfo{".plt", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+			pltStart, pltSize, 0, 0, 16})
 		trackMetadata(pltStart, pltSize)
 	}
 
 	// 9. .dynamic
 	if r.dynamicAddr != 0 && r.dynamicSize > 0 {
-		r.addSection(".dynamic", SHT_DYNAMIC, SHF_ALLOC|SHF_WRITE,
-			r.dynamicOffset, r.dynamicSize, uint32(dynstrIdx), 0, 16)
+		pendingSections = append(pendingSections, sectionInfo{".dynamic", SHT_DYNAMIC, SHF_ALLOC|SHF_WRITE,
+			r.dynamicOffset, r.dynamicSize, 0, 0, 16})
 	}
 
 	// 10. .got
 	if r.gotOffset != 0 && r.gotSize > 0 {
-		r.addSection(".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
-			r.gotOffset, r.gotSize, 0, 0, 8)
+		pendingSections = append(pendingSections, sectionInfo{".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+			r.gotOffset, r.gotSize, 0, 0, 8})
 	}
 
 	// 11. .got.plt (DT_PLTGOT)
 	if r.pltGotOffset != 0 && r.pltGotSize > 0 {
-		r.addSection(".got.plt", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
-			r.pltGotOffset, r.pltGotSize, 0, 0, 8)
+		pendingSections = append(pendingSections, sectionInfo{".got.plt", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+			r.pltGotOffset, r.pltGotSize, 0, 0, 8})
 	}
 
 	// 12. .init_array
 	if r.initArrayOffset != 0 && r.initArraySize > 0 {
-		r.addSection(".init_array", SHT_INIT_ARRAY, SHF_ALLOC|SHF_WRITE,
-			r.initArrayOffset, r.initArraySize, 0, 0, 8)
+		pendingSections = append(pendingSections, sectionInfo{".init_array", SHT_INIT_ARRAY, SHF_ALLOC|SHF_WRITE,
+			r.initArrayOffset, r.initArraySize, 0, 0, 8})
 	}
 
 	// 13. .fini_array
 	if r.finiArrayOffset != 0 && r.finiArraySize > 0 {
-		r.addSection(".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE,
-			r.finiArrayOffset, r.finiArraySize, 0, 0, 8)
+		pendingSections = append(pendingSections, sectionInfo{".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE,
+			r.finiArrayOffset, r.finiArraySize, 0, 0, 8})
 	}
 
 	// 14. .text - find from PT_LOAD with R+X flags
@@ -307,32 +320,68 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 					addr = minStart
 					size -= diff
 				} else {
-					// Should not happen if filtered correctly
 					size = 0
 				}
 			}
 
 			if size > 0 {
-				r.addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
-					addr, size, 0, 0, 0)
+				pendingSections = append(pendingSections, sectionInfo{".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR,
+					addr, size, 0, 0, 0})
 			}
 			break
 		}
 	}
 
 	// 11. .data - find from PT_LOAD with R+W flags (non-executable)
-	dataStart := uint64(0xffffffffffffffff)
-	dataEnd := uint64(0)
 	for _, phdr := range r.Phdrs {
 		if phdr.Type == PT_LOAD && (phdr.Flags&PF_W) != 0 && (phdr.Flags&PF_X) == 0 {
-			dataStart = min(dataStart, phdr.Vaddr)
-			dataEnd = max(dataEnd, phdr.Vaddr+phdr.Filesz, phdr.Vaddr+phdr.Memsz)
+			addr := phdr.Vaddr
+			size := max(phdr.Filesz, phdr.Memsz)
+
+			for _, s := range pendingSections {
+				if s.addr == addr && s.size > 0 {
+					addr += s.size
+					if size > s.size {
+						size -= s.size
+					} else {
+						size = 0
+					}
+				}
+			}
+
+			if size > 0 {
+				pendingSections = append(pendingSections, sectionInfo{".data", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
+					addr, size, 0, 0, 0})
+			}
 		}
 	}
-	if dataEnd != 0 {
-		r.addSection(".data", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE,
-			dataStart, dataEnd-dataStart, 0, 0, 0)
 
+	// Sort by address
+	sort.Slice(pendingSections, func(i, j int) bool {
+		return pendingSections[i].addr < pendingSections[j].addr
+	})
+
+	// Add sorted sections
+	for _, s := range pendingSections {
+		idx := r.addSection(s.name, s.shType, s.flags, s.addr, s.size, s.link, s.info, s.entsize)
+		if s.name == ".dynstr" {
+			dynstrIdx = idx
+		} else if s.name == ".dynsym" {
+			dynsymIdx = idx
+		}
+	}
+
+	// Update link fields
+	for i := 1; i < len(r.sections); i++ {
+		sec := &r.sections[i]
+		switch sec.Type {
+		case SHT_DYNSYM, SHT_HASH, SHT_GNU_HASH, SHT_GNU_VERSYM, SHT_REL, SHT_RELA:
+			sec.Link = uint32(dynsymIdx)
+		case SHT_STRTAB, SHT_DYNAMIC, SHT_GNU_VERNEED:
+			if r.readSectionName(sec.Name) != ".shstrtab" {
+				sec.Link = uint32(dynstrIdx)
+			}
+		}
 	}
 
 	// 12. .shstrtab - add name, will set offset later

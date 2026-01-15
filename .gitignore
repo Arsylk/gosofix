@@ -1,4 +1,4 @@
-test/
+tests/*.so
 0x6e6fb54000_fix.so
 0x6e6fb54000_old.so
 0x759b2b2000_fix.so

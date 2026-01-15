@@ -444,10 +444,10 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 			return 0, fmt.Errorf("gnu_hash:read | %w", err)
 		}
 
-		// Calculate bucket and chain offsets
-		bloomSize := header.Maskwords * 8
-		bucketsOffset := r.gnuHashOffset + 16 + uint64(bloomSize)
-		chainsOffset := bucketsOffset + uint64(header.Nbuckets*4)
+		// Calculate bloom filter size
+		bloomSize := uint64(header.Maskwords) * 8
+		bucketsOffset := r.gnuHashOffset + 16 + bloomSize
+		chainsOffset := bucketsOffset + uint64(header.Nbuckets)*4
 
 		// Read buckets to find max symbol index
 		buckets := make([]uint32, header.Nbuckets)
@@ -496,8 +496,44 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 	return 0, fmt.Errorf("sym:count | missing DT_HASH or DT_GNU_HASH")
 }
 
+// calculateHashSizes determines the exact size of .hash and .gnu.hash sections
+func (r *ElfReader) calculateHashSizes() {
+	if r.hashOffset != 0 {
+		if _, err := r.File.Seek(int64(r.hashOffset), io.SeekStart); err == nil {
+			var header HashHeader
+			if err := binary.Read(r.File, binary.LittleEndian, &header); err == nil {
+				// size = header (8) + buckets (nbucket * 4) + chains (nchain * 4)
+				r.hashSize = 8 + uint64(header.Nbucket)*4 + uint64(header.Nchain)*4
+				logger.Debug("calc:hash", "size", r.hashSize)
+			}
+		}
+	}
+
+	if r.gnuHashOffset != 0 {
+		if _, err := r.File.Seek(int64(r.gnuHashOffset), io.SeekStart); err == nil {
+			var header GNUHashHeader
+			if err := binary.Read(r.File, binary.LittleEndian, &header); err == nil {
+				// size = header (16) + bloom filter (maskwords * 8) + buckets (nbuckets * 4) + chains
+				bloomSize := uint64(header.Maskwords) * 8
+				bucketsSize := uint64(header.Nbuckets) * 4
+				// We need to know the number of symbols in gnu.hash to find chains size
+				// Symbols in gnu.hash = total symbols - symndx
+				if r.symCount > uint64(header.Symndx) {
+					chainsSize := (r.symCount - uint64(header.Symndx)) * 4
+					r.gnuHashSize = 16 + bloomSize + bucketsSize + chainsSize
+					logger.Debug("calc:gnuhash", "size", r.gnuHashSize)
+				}
+			}
+		}
+	}
+}
+
 // ResolveMetadata resolves offsets for strings like soname, needed libs, and runpath
 func (r *ElfReader) ResolveMetadata() {
+	// Calculate hash sizes
+	r.calculateHashSizes()
+
+	// Resolve metadata
 	for _, entry := range r.Dyns {
 		switch entry.Tag {
 		case DT_NEEDED:
