@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/charmbracelet/log"
 )
 
 type ElfRebuilder struct {
@@ -63,9 +65,11 @@ func (r *ElfRebuilder) WriteFixedElf() error {
 		if err := r.writeAtOffset(offset+40, size); err != nil {
 			return fmt.Errorf("failed to write phdr memsz %d: %w", size, err)
 		}
-		logger.Debug("write:phdr", "idx", i, "type", phdr.Type.Text(), "vaddr", phdr.Vaddr, "paddr", phdr.Vaddr, "filesz", size, "memsz", size)
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("phdr:write", "idx", i, "type", phdr.Type.Text(), "vaddr", phdr.Vaddr, "paddr", phdr.Vaddr, "filesz", size, "memsz", size)
+		}
 	}
-	logger.Info("write:phdrs", "count", len(r.Phdrs))
+	logger.Info("phdr:write", "count", len(r.Phdrs))
 
 	if err := r.writeFixedInitsFinis(); err != nil {
 		return fmt.Errorf("failed to write init/fini arrays: %w", err)
@@ -81,7 +85,6 @@ func (r *ElfRebuilder) WriteFixedElf() error {
 		return fmt.Errorf("failed to write section headers: %w", err)
 	}
 
-	logger.Info("write:done")
 	return nil
 }
 
@@ -100,7 +103,7 @@ func (r *ElfRebuilder) copyInput() error {
 		return fmt.Errorf("failed to copy file: %w", err)
 	}
 
-	logger.Info("write:copied", "size", copied)
+	logger.Info("file:copy", "size", copied)
 	return nil
 }
 
@@ -240,11 +243,11 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 
 	// 6. .rel.plt or .rela.plt
 	if r.jmprelOffset != 0 && r.jmprelSize > 0 {
-		switch r.jmprelEntry {
-		case uint64(binary.Size(Elf64_Rel{})):
+		switch r.jmprelEntrySize {
+		case 16:
 			pendingSections = append(pendingSections, sectionInfo{".rel.plt", SHT_REL, SHF_ALLOC|SHF_INFO_LINK,
 				r.jmprelOffset, r.jmprelSize, 0, 0, 16})
-		case uint64(binary.Size(Elf64_Rela{})):
+		case 24:
 			pendingSections = append(pendingSections, sectionInfo{".rela.plt", SHT_RELA, SHF_ALLOC|SHF_INFO_LINK,
 				r.jmprelOffset, r.jmprelSize, 0, 0, 24})
 		}
@@ -266,8 +269,8 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 
 	// 8. .plt - Procedure Linkage Table
 	// Calculated from .rela.plt entries
-	if r.jmprelSize > 0 && r.jmprelEntry > 0 {
-		count := r.jmprelSize / r.jmprelEntry
+	if r.jmprelSize > 0 && r.jmprelEntrySize > 0 {
+		count := r.jmprelSize / r.jmprelEntrySize
 		pltSize := uint64(32) + count*16 // 32 byte header + 16 bytes per entry
 		pltStart := AlignUp(maxMetadataEnd, 16)
 
@@ -415,7 +418,9 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		if err := r.writeAtOffset(offset, &section); err != nil {
 			return err
 		}
-		logger.Debug("write:section", "idx", i, "addr", section.Addr, "size", section.Size, "name", r.readSectionName(section.Name))
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("shdr:write", "idx", i, "addr", section.Addr, "size", section.Size, "name", r.readSectionName(section.Name))
+		}
 	}
 
 	// e_shoff at offset 40 (8 bytes)
@@ -432,7 +437,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	if err := r.writeAtOffset(62, eShStrNdx); err != nil {
 		return err
 	}
-	logger.Info("write:ehdr", "e_shoff", shdrOffset, "e_shnum", eShNum, "e_shstrndx", eShStrNdx)
+	logger.Info("ehdr:write", "e_shoff", shdrOffset, "e_shnum", eShNum, "e_shstrndx", eShStrNdx)
 
 	// Fix symbol section indices
 	fixedSyms := r.fixSymbolSectionIndices()
@@ -440,7 +445,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		if err := r.writeSymbolShndx(); err != nil {
 			return fmt.Errorf("failed to fix symbol shndx: %w", err)
 		}
-		logger.Info("write:syms", "count", fixedSyms)
+		logger.Info("sym:write", "count", fixedSyms)
 	}
 
 	return nil
@@ -511,9 +516,7 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 			if err := r.writeAtOffset(r.initOffset, newVal); err != nil {
 				return fmt.Errorf("failed to write init: %w", err)
 			}
-			logger.Debug("write:init", "offset", r.initOffset, "val", fmt.Sprintf("0x%x", newVal))
-		} else {
-			logger.Debug("pass:init", "offset", r.initOffset, "val", fmt.Sprintf("0x%x", value))
+			logger.Debug("init:write", "offset", r.initOffset, "val", newVal)
 		}
 	}
 
@@ -524,9 +527,7 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 			if err := r.writeAtOffset(r.finiOffset, newVal); err != nil {
 				return fmt.Errorf("failed to write fini: %w", err)
 			}
-			logger.Debug("write:fini", "offset", r.finiOffset, "val", fmt.Sprintf("0x%x", newVal))
-		} else {
-			logger.Debug("pass:fini", "offset", r.finiOffset, "val", fmt.Sprintf("0x%x", value))
+			logger.Debug("fini:write", "offset", r.finiOffset, "val", newVal)
 		}
 	}
 
@@ -540,12 +541,10 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 				if err := r.writeAtOffset(offset, newVal); err != nil {
 					return fmt.Errorf("failed to write init_array: %w", err)
 				}
-				logger.Debug("write:init_array", "offset", offset, "val", fmt.Sprintf("0x%x", newVal))
-			} else {
-				logger.Debug("pass:init_array", "offset", offset, "val", fmt.Sprintf("0x%x", value))
+				logger.Debug("init_array:write", "idx", i, "offset", offset, "val", newVal)
 			}
 		}
-		logger.Info("write:init_array", "count", initArrayCount)
+		logger.Info("init_array:write", "count", initArrayCount)
 	}
 
 	if r.finiArraySize > 0 && r.finiArrayOffset != 0 {
@@ -558,12 +557,10 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 				if err := r.writeAtOffset(offset, newVal); err != nil {
 					return fmt.Errorf("failed to write fini_array: %w", err)
 				}
-				logger.Debug("write:fini_array", "offset", offset, "val", fmt.Sprintf("0x%x", newVal))
-			} else {
-				logger.Debug("pass:fini_array", "offset", offset, "val", fmt.Sprintf("0x%x", value))
+				logger.Debug("fini_array:write", "idx", i, "offset", offset, "val", newVal)
 			}
 		}
-		logger.Info("write:fini_array", "count", finiArrayCount)
+		logger.Info("fini_array:write", "count", finiArrayCount)
 	}
 
 	return nil
@@ -572,6 +569,7 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 // writeFixedRelocs writes REL, RELA & JMPREL(A)
 func (r *ElfRebuilder) writeFixedRelocs() error {
 	// Fix REL relocations - write to target locations
+	relCount := 0
 	for i, rel := range r.Rel {
 		// Target location is rel.Offset (already normalized)
 		targetOffset := rel.Offset
@@ -579,13 +577,14 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
 			return fmt.Errorf("failed to write rel: %w", err)
 		}
-		logger.Debug("write:rel", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
-	}
-	if len(r.Rel) > 0 {
-		logger.Info("write:rel", "count", len(r.Rel))
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("rel:write", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
+		}
+		relCount++
 	}
 
 	// Fix RELA relocations - write to target locations
+	relaCount := 0
 	for i, rela := range r.Rela {
 		// Target location is rela.Offset (already normalized)
 		targetOffset := rela.Offset
@@ -593,39 +592,41 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
 			return fmt.Errorf("failed to write rela: %w", err)
 		}
-		logger.Debug("write:rela", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
-	}
-	if len(r.Rela) > 0 {
-		logger.Info("write:rela", "count", len(r.Rela))
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("rela:write", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
+		}
+		relaCount++
 	}
 
 	// Fix JmpRel relocations - write to target locations
+	jmprelCount := 0
 	for i, rel := range r.JmpRel {
 		targetOffset := rel.Offset
 		fixedVal := r.computeRelValue(&rel)
 		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
 			return fmt.Errorf("failed to write jmprel: %w", err)
 		}
-		logger.Debug("write:jmprel", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
-	}
-	if len(r.JmpRel) > 0 {
-		logger.Info("write:jmprel", "count", len(r.JmpRel))
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("jmprel:write", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rel.Type().Text())
+		}
+		jmprelCount++
 	}
 
 	// Fix JmpRela relocations - write to target locations
+	jmprelaCount := 0
 	for i, rela := range r.JmpRela {
 		targetOffset := rela.Offset
 		fixedVal := r.computeRelaValue(&rela)
 		if err := r.writeAtOffset(targetOffset, fixedVal); err != nil {
 			return fmt.Errorf("failed to write jmprela: %w", err)
 		}
-		logger.Debug("write:jmprela", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
-	}
-	if len(r.JmpRela) > 0 {
-		logger.Info("write:jmprela", "count", len(r.JmpRela))
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("jmprela:write", "idx", i, "offset", targetOffset, "val", fixedVal, "type", rela.Type().Text())
+		}
+		jmprelaCount++
 	}
 
-	logger.Info("write:relocs", "count", len(r.Rel)+len(r.Rela)+len(r.JmpRel)+len(r.JmpRela))
+	logger.Info("relocs:write", "count", relCount+relaCount+jmprelCount+jmprelaCount)
 
 	return nil
 }
@@ -639,7 +640,9 @@ func (r *ElfRebuilder) computeRelValue(rel *Elf64_Rel) uint64 {
 	if relocSym < uint32(len(r.Symbols)) {
 		sym := r.Symbols[relocSym]
 		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
-		logger.Debug("resolve:rel", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("rel:resolve", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		}
 		S = sym.St_Value
 	}
 
@@ -651,9 +654,13 @@ func (r *ElfRebuilder) computeRelValue(rel *Elf64_Rel) uint64 {
 	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT:
 		return S
 	case R_AARCH64_RELATIVE:
-		// For RELATIVE: the stored value is base + original, we need original
+		// For RELATIVE: the stored value is base + original.
+		// We only subtract base if it looks like it contains an absolute address from this dump.
 		currentVal := r.readUint64At(fileOffset)
-		return currentVal - r.BaseAddr
+		if r.BaseAddr != 0 && currentVal >= r.BaseAddr {
+			return currentVal - r.BaseAddr
+		}
+		return currentVal
 	case R_AARCH64_TLS_DTPMOD:
 		return 1 // Module ID for same module
 	case R_AARCH64_TLS_DTPREL:
@@ -673,7 +680,9 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela) uint64 {
 	if relocSym < uint32(len(r.Symbols)) {
 		sym := r.Symbols[relocSym]
 		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
-		logger.Debug("resolve:rela", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		if logger.GetLevel() == log.DebugLevel {
+			logger.Debug("rela:resolve", "sym", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		}
 		S = int64(sym.St_Value)
 	}
 
@@ -685,9 +694,13 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela) uint64 {
 	case R_AARCH64_NONE:
 		return uint64(A)
 	case R_AARCH64_RELATIVE:
-		// For memory dumps: location contains (BaseAddr + A), read and subtract base
+		// For memory dumps: location contains (BaseAddr + A).
+		// We only subtract base if it looks like it contains an absolute address from this dump.
 		currentVal := r.readUint64At(fileOffset)
-		return currentVal - r.BaseAddr
+		if r.BaseAddr != 0 && currentVal >= r.BaseAddr {
+			return currentVal - r.BaseAddr
+		}
+		return currentVal
 	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT:
 		return uint64(S + A)
 	case R_AARCH64_ABS64:

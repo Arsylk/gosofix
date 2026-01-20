@@ -41,16 +41,16 @@ func init() {
 	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe"))
 
 	// Address values get orange highlight
-	for _, key := range []string{"vaddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2", "e_shoff"} {
+	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2", "e_shoff", "start", "val"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Transform(func(s string) string {
-			if num, err := strconv.Atoi(s); err == nil {
+			if num, err := strconv.ParseUint(s, 0, 64); err == nil {
 				return fmt.Sprintf("0x%x", num)
 			}
 			return s
 		})
 	}
 	// Numbers get magenta
-	for _, key := range []string{"idx", "size", "memsz", "filesz", "count", "e_shnum", "e_shstrndx"} {
+	for _, key := range []string{"idx", "size", "memsz", "filesz", "count", "e_shnum", "e_shstrndx", "phentsize", "entries", "totalSize"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#CBA6F7"))
 	}
 	// Type tags get blue bold
@@ -58,7 +58,7 @@ func init() {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
 	}
 	// File paths get yellow
-	for _, key := range []string{"file", "path", "runpath"} {
+	for _, key := range []string{"file", "path", "runpath", "outpath"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
 	}
 	// Names get green
@@ -74,15 +74,17 @@ func init() {
 }
 
 // FixELFHeaders attempts to fix common issues with ELF headers.
-// verbosity: 0=quiet (warn only), 1=info, 2+=debug
+// verbosity: 0=quiet (warn only), 1=info, 2=debug, 3=trace (granular)
 func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosity int) (error, string) {
 	switch verbosity {
 	case 0:
 		logger.SetLevel(log.WarnLevel)
 	case 1:
 		logger.SetLevel(log.InfoLevel)
-	default:
+	case 2:
 		logger.SetLevel(log.DebugLevel)
+	default:
+		logger.SetLevel(log.DebugLevel) // Use Debug for 3+ but logic in callers will filter
 	}
 	logger.Info("elf:fix", "file", filePath, "base", baseAddr)
 
@@ -107,6 +109,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 	if err != nil {
 		return fmt.Errorf("failed to create rebuilder: %w", err), ""
 	}
+	defer rebuilder.OutFile.Close()
 
 	err = rebuilder.WriteFixedElf()
 	if err != nil {

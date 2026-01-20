@@ -5,29 +5,17 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch file",
-            "type": "go",
-            "request": "launch",
-            "mode": "debug",
-            "program": "${file}",
-            "args": [
-                "-d",
-                "tests/libdexprotector.so_dump_0x6ddc6d8000.so",
-                "0x6ddc6d8000"
-            ]
-        },
-        {
             "name": "Launch Package",
             "type": "go",
             "request": "launch",
-            "mode": "debug",
+            "mode": "auto",
             "program": "${workspaceFolder}/cmd/main.go",
-            "cwd": "${workspaceFolder}",
             "args": [
-                "-d",
-                "tests/libdexprotector.so_dump_0x6ddc6d8000.so",
-                "0x6ddc6d8000"
-            ]
-        }
+                "-v",
+                "2",
+                "${workspaceFolder}/tests/libdexprotector.so_dump_0x6ddc6d8000.so",
+            ],
+            "console": "integratedTerminal"
+        },
     ]
 }
