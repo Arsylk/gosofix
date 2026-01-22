@@ -41,7 +41,7 @@ func init() {
 	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe"))
 
 	// Address values get orange highlight
-	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2", "e_shoff", "start", "val"} {
+	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2", "e_shoff", "start"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Transform(func(s string) string {
 			if num, err := strconv.ParseUint(s, 0, 64); err == nil {
 				return fmt.Sprintf("0x%x", num)
@@ -66,7 +66,7 @@ func init() {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	}
 
-	logger = log.NewWithOptions(os.Stderr, log.Options{
+	logger = log.NewWithOptions(os.Stdout, log.Options{
 		ReportTimestamp: false,
 		ReportCaller:    false,
 	})
@@ -74,7 +74,7 @@ func init() {
 }
 
 // FixELFHeaders attempts to fix common issues with ELF headers.
-// verbosity: 0=quiet (warn only), 1=info, 2=debug, 3=trace (granular)
+// verbosity: 0=quiet (warn only), 1=info, 2=debug
 func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosity int) (error, string) {
 	switch verbosity {
 	case 0:
@@ -84,7 +84,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 	case 2:
 		logger.SetLevel(log.DebugLevel)
 	default:
-		logger.SetLevel(log.DebugLevel) // Use Debug for 3+ but logic in callers will filter
+		logger.SetLevel(log.InfoLevel)
 	}
 	logger.Info("elf:fix", "file", filePath, "base", baseAddr)
 

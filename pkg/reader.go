@@ -150,6 +150,12 @@ func (r *ElfReader) ReadElfHeader() error {
 	if err := binary.Read(r.File, binary.LittleEndian, r.ElfHeader); err != nil {
 		return fmt.Errorf("failed to read ELF header: %w", err)
 	}
+
+	// Normalize entry point if it appears absolute
+	if r.BaseAddr != 0 && r.ElfHeader.Entry >= r.BaseAddr {
+		r.ElfHeader.Entry -= r.BaseAddr
+	}
+
 	if r.ElfHeader.Magic != [4]byte{0x7f, 'E', 'L', 'F'} {
 		return fmt.Errorf("invalid ELF magic number: %x (expected 0x7f454c46)", r.ElfHeader.Magic)
 	}
@@ -383,12 +389,12 @@ func (r *ElfReader) readSymbols() error {
 	}
 
 	// Normalize symbol values
-	// for i := range r.Symbols {
-	// 	sym := &r.Symbols[i]
-	// 	if r.BaseAddr != 0 && sym.St_Value >= r.BaseAddr {
-	// 		sym.St_Value -= r.BaseAddr
-	// 	}
-	// }
+	for i := range r.Symbols {
+		sym := &r.Symbols[i]
+		if r.BaseAddr != 0 && sym.St_Value >= r.BaseAddr {
+			sym.St_Value -= r.BaseAddr
+		}
+	}
 
 	return nil
 }
@@ -403,6 +409,12 @@ func (r *ElfReader) readRelocationTables() error {
 		if r.Rel, err = readArray[Elf64_Rel](r.File, r.relOffset, relCount, "DT_REL"); err != nil {
 			return err
 		}
+		// Normalize REL offsets
+		for i := range r.Rel {
+			if r.BaseAddr != 0 && r.Rel[i].Offset >= r.BaseAddr {
+				r.Rel[i].Offset -= r.BaseAddr
+			}
+		}
 	}
 
 	if r.relaOffset != 0 {
@@ -410,6 +422,12 @@ func (r *ElfReader) readRelocationTables() error {
 		logger.Info("rela:read", "offset", r.relaOffset, "count", relaCount)
 		if r.Rela, err = readArray[Elf64_Rela](r.File, r.relaOffset, relaCount, "DT_RELA"); err != nil {
 			return err
+		}
+		// Normalize RELA offsets
+		for i := range r.Rela {
+			if r.BaseAddr != 0 && r.Rela[i].Offset >= r.BaseAddr {
+				r.Rela[i].Offset -= r.BaseAddr
+			}
 		}
 	}
 
@@ -421,11 +439,23 @@ func (r *ElfReader) readRelocationTables() error {
 			if r.JmpRel, err = readArray[Elf64_Rel](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
 			}
+			// Normalize JMPREL (REL) offsets
+			for i := range r.JmpRel {
+				if r.BaseAddr != 0 && r.JmpRel[i].Offset >= r.BaseAddr {
+					r.JmpRel[i].Offset -= r.BaseAddr
+				}
+			}
 		case uint64(binary.Size(Elf64_Rela{})):
 			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rela{}))
 			logger.Info("jmprel:read", "offset", r.jmprelOffset, "count", jmprelCount, "type", "RELA")
 			if r.JmpRela, err = readArray[Elf64_Rela](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
+			}
+			// Normalize JMPRELA (RELA) offsets
+			for i := range r.JmpRela {
+				if r.BaseAddr != 0 && r.JmpRela[i].Offset >= r.BaseAddr {
+					r.JmpRela[i].Offset -= r.BaseAddr
+				}
 			}
 		default:
 			logger.Error("jmprel:read", "msg", "invalid entry size", "size", r.jmprelEntrySize)
