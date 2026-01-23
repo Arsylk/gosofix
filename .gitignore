@@ -1,3 +1,5 @@
 tests/*.so
 dist/
 build/
+.xmake
+dist
