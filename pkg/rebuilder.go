@@ -38,17 +38,23 @@ func NewElfRebuilder(reader *ElfReader, outputPath string) (*ElfRebuilder, error
 
 // WriteFixedElf copies the source file and writes fixed relocation values
 func (r *ElfRebuilder) WriteFixedElf() error {
-	r.copyInput()
+	if err := r.rebuildFileLayout(); err != nil {
+		return fmt.Errorf("failed to rebuild file layout: %w", err)
+	}
 
 	// Fix ELF Header - write normalized Entry address
 	if err := r.writeAtOffset(24, r.ElfHeader.Entry); err != nil {
 		return fmt.Errorf("failed to write ehdr entry: %w", err)
 	}
 
-	// Fix program headers - write normalized Vaddr values
+	// Fix program headers - write normalized Vaddr and Offset values
 	phdrOffset := r.ElfHeader.PhdrOffset
 	for i, phdr := range r.Phdrs {
 		offset := phdrOffset + uint64(i)*uint64(r.ElfHeader.Phentsize)
+		// Write fixed Offset
+		if err := r.writeAtOffset(offset+8, phdr.Offset); err != nil {
+			return fmt.Errorf("failed to write phdr offset %d: %w", phdr.Offset, err)
+		}
 		// Write fixed Vaddr & Paddr
 		if err := r.writeAtOffset(offset+16, phdr.Vaddr); err != nil {
 			return fmt.Errorf("failed to write phdr vaddr %d: %w", phdr.Vaddr, err)
@@ -65,7 +71,7 @@ func (r *ElfRebuilder) WriteFixedElf() error {
 		if err := r.writeAtOffset(offset+40, size); err != nil {
 			return fmt.Errorf("failed to write phdr memsz %d: %w", size, err)
 		}
-		logger.Debug("phdr:write", "idx", i, "type", phdr.Type.Text(), "vaddr", phdr.Vaddr, "paddr", phdr.Vaddr, "filesz", size, "memsz", size)
+		logger.Debug("phdr:write", "idx", i, "type", phdr.Type.Text(), "vaddr", phdr.Vaddr, "paddr", phdr.Vaddr, "offset", phdr.Offset, "filesz", size, "memsz", size)
 	}
 	logger.Info("phdrs:write", "count", len(r.Phdrs))
 
@@ -97,28 +103,24 @@ func (r *ElfRebuilder) WriteFixedElf() error {
 	return nil
 }
 
-func (r *ElfRebuilder) copyInput() error {
-	// Copy entire source file to output
-	_, err := r.File.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat source file: %w", err)
-	}
-	// Copy entire source file
-	if _, err := r.File.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek source: %w", err)
-	}
-	copied, err := io.Copy(r.OutFile, r.File)
-	if err != nil {
-		return fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	logger.Info("file:copy", "size", copied)
-	return nil
-}
-
 func (r *ElfRebuilder) addSection(name string, shType SHT_Type, flags uint64, addr uint64, size uint64, link uint32, info uint32, entsize uint64) int {
 	nameOffset := r.addSectionName(name)
 	fileOffset := r.vaddrToOffset(addr)
+
+	// Calculate correct alignment: must be power of 2 and divide addr
+	var align uint64 = 8
+	// SHT_NOTE usually implies 4-byte alignment on Linux/Android even for 64-bit binaries
+	// If we force 8-byte alignment on a 4-byte aligned note section, tools like readelf
+	// will miscalculate note boundaries.
+	if shType == SHT_NOTE {
+		align = 4
+	}
+
+	if addr != 0 {
+		for align > 1 && addr%align != 0 {
+			align >>= 1
+		}
+	}
 
 	section := Elf64_Shdr{
 		Name:      nameOffset,
@@ -129,7 +131,7 @@ func (r *ElfRebuilder) addSection(name string, shType SHT_Type, flags uint64, ad
 		Size:      size,
 		Link:      link,
 		Info:      info,
-		Addralign: 8,
+		Addralign: align,
 		Entsize:   entsize,
 	}
 	idx := len(r.sections)
@@ -158,20 +160,6 @@ func (r *ElfRebuilder) readSectionName(nameOffset uint32) string {
 		}
 	}
 	return ""
-}
-
-func (r *ElfRebuilder) vaddrToOffset(vaddr uint64) uint64 {
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD {
-			if vaddr >= phdr.Vaddr && vaddr < phdr.Vaddr+phdr.Memsz {
-				// We need the ORIGINAL offset from the reader's program headers
-				// because we haven't modified the file layout yet.
-				// Wait, the reader's program headers already have original offsets.
-				return phdr.Offset + (vaddr - phdr.Vaddr)
-			}
-		}
-	}
-	return vaddr
 }
 
 func (r *ElfRebuilder) writeSectionHeaders() error {
@@ -215,7 +203,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	}
 	if r.gnuHashOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".gnu.hash", SHT_GNU_HASH, SHF_ALLOC,
-			r.gnuHashOffset, r.gnuHashSize, 0, 0, 8})
+			r.gnuHashOffset, r.gnuHashSize, 0, 0, 0})
 	}
 	if r.versymOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC,
@@ -223,7 +211,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	}
 	if r.verneedOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC,
-			r.verneedOffset, r.verneedSize, 0, uint32(r.verneedNum), 4})
+			r.verneedOffset, r.verneedSize, 0, uint32(r.verneedNum), 0})
 	}
 	if r.relaOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".rela.dyn", SHT_RELA, SHF_ALLOC,
@@ -235,17 +223,47 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	}
 	if r.jmprelOffset != 0 {
 		name := ".rela.plt"
+		shType := SHT_RELA
 		if r.jmprelEntrySize == 16 {
 			name = ".rel.plt"
+			shType = SHT_REL
 		}
-		knownSections = append(knownSections, sectionInfo{name, SHT_RELA, SHF_ALLOC | SHF_INFO_LINK,
+		knownSections = append(knownSections, sectionInfo{name, shType, SHF_ALLOC | SHF_INFO_LINK,
 			r.jmprelOffset, r.jmprelSize, 0, 0, r.jmprelEntrySize})
 
-		// PLT section header
+		// PLT section header - in memory dumps, PLT is usually right after the last metadata in the first segment
+		// or at a fixed location. For libBlackWhiteCrash.so, it's at 0x3bbb30 in a DIFFERENT segment (Segment 2).
+		// Our heuristic should try to find where PLT actually resides if possible.
 		pltSize := uint64(32) + (r.jmprelSize/r.jmprelEntrySize)*16
 		pltAddr := AlignUp(r.jmprelOffset+r.jmprelSize, 16)
-		knownSections = append(knownSections, sectionInfo{".plt", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
-			pltAddr, pltSize, 0, 0, 16})
+
+		// Check if this calculated PLT address actually lands in an executable segment.
+		isExec := false
+		for _, phdr := range r.Phdrs {
+			if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 {
+				if pltAddr >= phdr.Vaddr && pltAddr < phdr.Vaddr+phdr.Memsz {
+					isExec = true
+					break
+				}
+			}
+		}
+
+		if !isExec {
+			// If our heuristic failed, try looking for the PLT in the first executable segment.
+			// In many Android libraries, .plt is at the start or end of the executable segment.
+			for _, phdr := range r.Phdrs {
+				if phdr.Type == PT_LOAD && (phdr.Flags&PF_X) != 0 {
+					pltAddr = phdr.Vaddr + phdr.Memsz - pltSize
+					isExec = true
+					break
+				}
+			}
+		}
+
+		if isExec {
+			knownSections = append(knownSections, sectionInfo{".plt", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+				pltAddr, pltSize, 0, 0, 16})
+		}
 	}
 	if r.dynamicOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE,
@@ -266,6 +284,16 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	if r.finiArrayOffset != 0 {
 		knownSections = append(knownSections, sectionInfo{".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE,
 			r.finiArrayOffset, r.finiArraySize, 0, 0, 8})
+	}
+
+	// Add additional metadata found in program headers
+	if r.ehFrameHdrOffset != 0 {
+		knownSections = append(knownSections, sectionInfo{".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC,
+			r.ehFrameHdrOffset, r.ehFrameHdrSize, 0, 0, 4})
+	}
+	if r.noteOffset != 0 {
+		knownSections = append(knownSections, sectionInfo{".note.gnu.build-id", SHT_NOTE, SHF_ALLOC,
+			r.noteOffset, r.noteSize, 0, 0, 4})
 	}
 
 	// 2. Identify the largest gap in each PT_LOAD segment and name it .text/.data
@@ -306,35 +334,37 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		}
 
 		if len(ranges) > 0 {
-			// Pick largest gap
-			var best struct{ start, end uint64 }
-			var maxLen uint64 = 0
-			for _, r := range ranges {
-				if r.end-r.start > maxLen {
-					maxLen = r.end - r.start
-					best = r
+			// Determine base name and flags based on segment type
+			baseName := ".text"
+			var baseFlags uint64 = SHF_ALLOC
+			if (phdr.Flags & PF_X) != 0 {
+				baseFlags |= SHF_EXECINSTR
+			} else if (phdr.Flags & PF_W) != 0 {
+				baseName = ".data"
+				// Check if this segment is RELRO
+				for _, p := range r.Phdrs {
+					if p.Type == PT_GNU_RELRO && p.Vaddr == phdr.Vaddr {
+						baseName = ".data.rel.ro"
+						break
+					}
 				}
+				baseFlags |= SHF_WRITE
+			} else {
+				baseName = ".rodata"
 			}
 
-			if maxLen > 0 {
-				name := ".text"
-				var flags uint64 = SHF_ALLOC
-				if (phdr.Flags & PF_X) != 0 {
-					flags |= SHF_EXECINSTR
-				} else if (phdr.Flags & PF_W) != 0 {
-					name = ".data"
-					// Check if this segment is RELRO
-					for _, p := range r.Phdrs {
-						if p.Type == PT_GNU_RELRO && p.Vaddr == phdr.Vaddr {
-							name = ".data.rel.ro"
-							break
-						}
+			// Add ALL gaps as sections, not just the largest
+			gapCount := 0
+			for _, gap := range ranges {
+				gapSize := gap.end - gap.start
+				if gapSize > 0 {
+					name := baseName
+					if gapCount > 0 {
+						name = fmt.Sprintf("%s_%d", baseName, gapCount)
 					}
-					flags |= SHF_WRITE
-				} else {
-					name = ".rodata"
+					finalSections = append(finalSections, sectionInfo{name, SHT_PROGBITS, baseFlags, gap.start, gapSize, 0, 0, 0})
+					gapCount++
 				}
-				finalSections = append(finalSections, sectionInfo{name, SHT_PROGBITS, flags, best.start, maxLen, 0, 0, 0})
 			}
 		}
 	}
@@ -345,7 +375,9 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	// Dedup and add
 	var lastAddr uint64 = 0
 	for _, s := range finalSections {
-		if s.addr < lastAddr { continue } // Skip if overlaps (shouldn't happen with gap logic)
+		if s.addr < lastAddr {
+			continue
+		} // Skip if overlaps (shouldn't happen with gap logic)
 		idx := r.addSection(s.name, s.shType, s.flags, s.addr, s.size, s.link, s.info, s.entsize)
 		switch s.name {
 		case ".dynstr":
@@ -359,16 +391,12 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	// 4. Update link fields
 	for i := 1; i < len(r.sections); i++ {
 		sec := &r.sections[i]
-		name := r.readSectionName(sec.Name)
 		switch sec.Type {
-		case SHT_DYNSYM, SHT_HASH, SHT_GNU_HASH, SHT_GNU_VERSYM, SHT_REL, SHT_RELA:
+		case SHT_DYNSYM:
+			sec.Link = uint32(dynstrIdx)
+		case SHT_HASH, SHT_GNU_HASH, SHT_GNU_VERSYM, SHT_REL, SHT_RELA:
 			sec.Link = uint32(dynsymIdx)
-		case SHT_STRTAB, SHT_DYNAMIC, SHT_GNU_VERNEED:
-			if name != ".shstrtab" {
-				sec.Link = uint32(dynstrIdx)
-			}
-		}
-		if name == ".dynsym" {
+		case SHT_DYNAMIC, SHT_GNU_VERNEED:
 			sec.Link = uint32(dynstrIdx)
 		}
 	}
@@ -387,7 +415,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 
 	// Update .shstrtab offset
 	ss := &r.sections[shstrtabIdx]
-	ss.Addr = shstrtabOffset
+	ss.Addr = 0
 	ss.Offset = shstrtabOffset
 
 	// Write .shstrtab data to file
@@ -409,6 +437,11 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 
 	// e_shoff at offset 40 (8 bytes)
 	if err := r.writeAtOffset(40, shdrOffset); err != nil {
+		return err
+	}
+	// e_shentsize at offset 58 (2 bytes)
+	eShEntSize := uint16(binary.Size(Elf64_Shdr{}))
+	if err := r.writeAtOffset(58, eShEntSize); err != nil {
 		return err
 	}
 	// e_shnum at offset 60 (2 bytes)
@@ -446,15 +479,20 @@ func (r *ElfRebuilder) fixSymbolSectionIndices() {
 
 // findSectionForAddr finds the section index that contains the given address
 func (r *ElfRebuilder) findSectionForAddr(addr uint64) uint16 {
+	bestIdx := uint16(0)
+	var minSize uint64 = ^uint64(0)
 	for i, sec := range r.sections {
 		if sec.Type == SHT_NULL || sec.Addr == 0 {
 			continue
 		}
 		if addr >= sec.Addr && addr < sec.Addr+sec.Size {
-			return uint16(i)
+			if sec.Size < minSize {
+				minSize = sec.Size
+				bestIdx = uint16(i)
+			}
 		}
 	}
-	return 0 // SHN_UNDEF
+	return bestIdx
 }
 
 // writeFixedInitsFinis writes addresses for init_array & finit_array
@@ -683,10 +721,62 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela) uint64 {
 	}
 }
 
-// writeUint64At writes a uint64 value at the specified offset
 func (r *ElfRebuilder) writeAtOffset(offset uint64, value any) error {
 	if _, err := r.OutFile.Seek(int64(offset), io.SeekStart); err != nil {
 		return err
 	}
 	return binary.Write(r.OutFile, binary.LittleEndian, value)
+}
+
+// rebuildFileLayout moves segments to match their virtual addresses in the output file
+func (r *ElfRebuilder) rebuildFileLayout() error {
+	// Find min and max Vaddr
+	var minVaddr uint64 = ^uint64(0)
+	var maxVaddr uint64 = 0
+	for _, phdr := range r.Phdrs {
+		if phdr.Type == PT_LOAD {
+			if phdr.Vaddr < minVaddr {
+				minVaddr = phdr.Vaddr
+			}
+			if phdr.Vaddr+phdr.Memsz > maxVaddr {
+				maxVaddr = phdr.Vaddr + phdr.Memsz
+			}
+		}
+	}
+	if minVaddr == ^uint64(0) {
+		minVaddr = 0
+	}
+
+	// Copy the entire range from minVaddr to maxVaddr from the source file.
+	// This preserves all code and data in gaps between segments (like PLTs).
+	totalSize := maxVaddr - minVaddr
+	data := make([]byte, totalSize)
+	_, err := r.File.ReadAt(data, int64(minVaddr))
+	if err != nil {
+		// If reading the whole range fails (e.g. dump is partial), fall back to segment-by-segment
+		logger.Warn("relayout:full_read_failed", "error", err, "msg", "falling back to segment-by-segment copy")
+		for i := range r.Phdrs {
+			p := &r.Phdrs[i]
+			if p.Type != PT_LOAD || p.Filesz == 0 {
+				continue
+			}
+			segmentData := make([]byte, p.Filesz)
+			if _, err := r.File.ReadAt(segmentData, int64(p.Offset)); err == nil {
+				r.OutFile.WriteAt(segmentData, int64(p.Vaddr-minVaddr))
+			}
+		}
+	} else {
+		_, err = r.OutFile.WriteAt(data, 0)
+		if err != nil {
+			return fmt.Errorf("failed to write expanded layout: %w", err)
+		}
+	}
+
+	// Update all PHDR offsets to match memory layout (Offset = Vaddr - minVaddr)
+	for i := range r.Phdrs {
+		r.Phdrs[i].Offset = r.Phdrs[i].Vaddr - minVaddr
+		logger.Debug("segment:relayout", "idx", i, "vaddr", r.Phdrs[i].Vaddr, "new_offset", r.Phdrs[i].Offset)
+	}
+
+	return nil
 }

@@ -195,9 +195,23 @@ func (r *ElfReader) ReadPhdrs() error {
 	for i := range r.Phdrs {
 		phdr := &r.Phdrs[i]
 
-		// Normalize Vaddr if it appears absolute
-		if r.BaseAddr != 0 && phdr.Vaddr >= r.BaseAddr {
-			phdr.Vaddr -= r.BaseAddr
+		// For memory dumps (linear), ignore the p_offset from the header and use p_vaddr
+		if r.BaseAddr != 0 {
+			if phdr.Vaddr >= r.BaseAddr {
+				phdr.Vaddr -= r.BaseAddr
+			}
+			// Force Offset to match Vaddr for reading from linear dump
+			phdr.Offset = phdr.Vaddr
+		}
+
+		// Extract metadata from program headers
+		switch phdr.Type {
+		case PT_GNU_EH_FRAME:
+			r.ehFrameHdrOffset = phdr.Vaddr
+			r.ehFrameHdrSize = phdr.Memsz
+		case PT_NOTE:
+			r.noteOffset = phdr.Vaddr
+			r.noteSize = phdr.Memsz
 		}
 
 		// Log all program headers with consistent format - Level 3
@@ -214,6 +228,17 @@ func (r *ElfReader) ReadPhdrs() error {
 	}
 
 	return nil
+}
+
+func (r *ElfReader) vaddrToOffset(vaddr uint64) uint64 {
+	for _, phdr := range r.Phdrs {
+		if phdr.Type == PT_LOAD {
+			if vaddr >= phdr.Vaddr && vaddr < phdr.Vaddr+phdr.Memsz {
+				return phdr.Offset + (vaddr - phdr.Vaddr)
+			}
+		}
+	}
+	return vaddr
 }
 
 func (r *ElfReader) ReadDyns() error {
@@ -238,14 +263,13 @@ func (r *ElfReader) ReadDyns() error {
 	logger.Info("dyn:read", "vaddr", dynamicPhdr.Vaddr, "count", entryCount)
 
 	// Store dynamic section info for rebuilder
-	// Vaddr for section address, also used as file offset for memory dumps
 	r.dynamicAddr = dynamicPhdr.Vaddr
-	r.dynamicOffset = dynamicPhdr.Vaddr // Use Vaddr as offset for memory dumps
+	r.dynamicOffset = dynamicPhdr.Vaddr // FALLBACK: Use Vaddr as offset for memory dumps
 	r.dynamicSize = dynamicPhdr.Memsz
 
 	// Read the dynamic section content
 	var err error
-	if r.Dyns, err = readArray[Elf64_Dyn](r.File, dynamicPhdr.Vaddr, entryCount, "DT_DYNAMIC"); err != nil {
+	if r.Dyns, err = readArray[Elf64_Dyn](r.File, r.dynamicOffset, entryCount, "DT_DYNAMIC"); err != nil {
 		return err
 	}
 
@@ -333,13 +357,14 @@ func (r *ElfReader) calculateVerneedSize() uint64 {
 	fileSize := uint64(fileInfo.Size())
 
 	for i := uint16(0); i < r.verneedNum; i++ {
-		if offset+16 > fileSize {
-			logger.Warn("verneed:bounds", "offset", offset, "filesize", fileSize)
+		fileOffset := r.vaddrToOffset(offset)
+		if fileOffset+16 > fileSize {
+			logger.Warn("verneed:bounds", "offset", fileOffset, "filesize", fileSize)
 			break
 		}
 
 		var verneed Elf64_Verneed
-		if _, err := r.File.Seek(int64(offset), io.SeekStart); err != nil {
+		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
 			break
 		}
 		if err := binary.Read(r.File, binary.LittleEndian, &verneed); err != nil {
@@ -347,8 +372,8 @@ func (r *ElfReader) calculateVerneedSize() uint64 {
 		}
 
 		entrySize := uint64(16) + uint64(verneed.Cnt)*16
-		if offset+entrySize > fileSize {
-			logger.Warn("verneed:entry_bounds", "offset", offset, "size", entrySize, "filesize", fileSize)
+		if fileOffset+entrySize > fileSize {
+			logger.Warn("verneed:entry_bounds", "offset", fileOffset, "size", entrySize, "filesize", fileSize)
 			break
 		}
 		totalSize += entrySize
@@ -383,8 +408,9 @@ func (r *ElfReader) readSymbols() error {
 		return nil
 	}
 
-	logger.Info("sym:read", "offset", r.symtabOffset, "count", r.symCount)
-	if r.Symbols, err = readArray[Elf64_Sym](r.File, r.symtabOffset, r.symCount, "DT_SYMTAB"); err != nil {
+	logger.Info("sym:read", "vaddr", r.symtabOffset, "count", r.symCount)
+	fileOffset := r.vaddrToOffset(r.symtabOffset)
+	if r.Symbols, err = readArray[Elf64_Sym](r.File, fileOffset, r.symCount, "DT_SYMTAB"); err != nil {
 		return fmt.Errorf("failed to read symbols: %w", err)
 	}
 
@@ -405,8 +431,9 @@ func (r *ElfReader) readRelocationTables() error {
 
 	if r.relOffset != 0 {
 		relCount := r.relSize / uint64(binary.Size(Elf64_Rel{}))
-		logger.Info("rel:read", "offset", r.relOffset, "count", relCount)
-		if r.Rel, err = readArray[Elf64_Rel](r.File, r.relOffset, relCount, "DT_REL"); err != nil {
+		fileOffset := r.vaddrToOffset(r.relOffset)
+		logger.Info("rel:read", "vaddr", r.relOffset, "count", relCount)
+		if r.Rel, err = readArray[Elf64_Rel](r.File, fileOffset, relCount, "DT_REL"); err != nil {
 			return err
 		}
 		// Normalize REL offsets
@@ -419,8 +446,9 @@ func (r *ElfReader) readRelocationTables() error {
 
 	if r.relaOffset != 0 {
 		relaCount := r.relaSize / uint64(binary.Size(Elf64_Rela{}))
-		logger.Info("rela:read", "offset", r.relaOffset, "count", relaCount)
-		if r.Rela, err = readArray[Elf64_Rela](r.File, r.relaOffset, relaCount, "DT_RELA"); err != nil {
+		fileOffset := r.vaddrToOffset(r.relaOffset)
+		logger.Info("rela:read", "vaddr", r.relaOffset, "count", relaCount)
+		if r.Rela, err = readArray[Elf64_Rela](r.File, fileOffset, relaCount, "DT_RELA"); err != nil {
 			return err
 		}
 		// Normalize RELA offsets
@@ -432,11 +460,12 @@ func (r *ElfReader) readRelocationTables() error {
 	}
 
 	if r.jmprelOffset != 0 {
+		fileOffset := r.vaddrToOffset(r.jmprelOffset)
 		switch r.jmprelEntrySize {
 		case uint64(binary.Size(Elf64_Rel{})):
 			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rel{}))
-			logger.Info("jmprel:read", "offset", r.jmprelOffset, "count", jmprelCount, "type", "REL")
-			if r.JmpRel, err = readArray[Elf64_Rel](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
+			logger.Info("jmprel:read", "vaddr", r.jmprelOffset, "count", jmprelCount, "type", "REL")
+			if r.JmpRel, err = readArray[Elf64_Rel](r.File, fileOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
 			}
 			// Normalize JMPREL (REL) offsets
@@ -447,8 +476,8 @@ func (r *ElfReader) readRelocationTables() error {
 			}
 		case uint64(binary.Size(Elf64_Rela{})):
 			jmprelCount := r.jmprelSize / uint64(binary.Size(Elf64_Rela{}))
-			logger.Info("jmprel:read", "offset", r.jmprelOffset, "count", jmprelCount, "type", "RELA")
-			if r.JmpRela, err = readArray[Elf64_Rela](r.File, r.jmprelOffset, jmprelCount, "DT_JMPREL"); err != nil {
+			logger.Info("jmprel:read", "vaddr", r.jmprelOffset, "count", jmprelCount, "type", "RELA")
+			if r.JmpRela, err = readArray[Elf64_Rela](r.File, fileOffset, jmprelCount, "DT_JMPRELA"); err != nil {
 				return err
 			}
 			// Normalize JMPRELA (RELA) offsets
@@ -457,8 +486,6 @@ func (r *ElfReader) readRelocationTables() error {
 					r.JmpRela[i].Offset -= r.BaseAddr
 				}
 			}
-		default:
-			logger.Error("jmprel:read", "msg", "invalid entry size", "size", r.jmprelEntrySize)
 		}
 	}
 
@@ -467,11 +494,10 @@ func (r *ElfReader) readRelocationTables() error {
 
 // calculateSymbolCount determines the total number of symbols using hash tables
 func (r *ElfReader) calculateSymbolCount() (uint64, error) {
-	// Try .hash table first (simpler, direct symbol count)
+	// Try standard .hash table first
 	if r.hashOffset != 0 {
-		logger.Debug("hash:read", "offset", r.hashOffset)
-
-		if _, err := r.File.Seek(int64(r.hashOffset), io.SeekStart); err != nil {
+		fileOffset := r.vaddrToOffset(r.hashOffset)
+		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("hash:seek | %w", err)
 		}
 
@@ -485,9 +511,10 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 
 	// Fall back to .gnu.hash table
 	if r.gnuHashOffset != 0 {
-		logger.Debug("gnuhash:read", "offset", r.gnuHashOffset)
+		fileOffset := r.vaddrToOffset(r.gnuHashOffset)
+		logger.Debug("gnuhash:read", "vaddr", r.gnuHashOffset, "offset", fileOffset)
 
-		if _, err := r.File.Seek(int64(r.gnuHashOffset), io.SeekStart); err != nil {
+		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("gnu_hash:seek | %w", err)
 		}
 
@@ -498,12 +525,12 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 
 		// Calculate bloom filter size
 		bloomSize := uint64(header.Maskwords) * 8
-		bucketsOffset := r.gnuHashOffset + 16 + bloomSize
-		chainsOffset := bucketsOffset + uint64(header.Nbuckets)*4
+		bucketsAddr := r.gnuHashOffset + 16 + bloomSize
+		chainsAddr := bucketsAddr + uint64(header.Nbuckets)*4
 
 		// Read buckets to find max symbol index
 		buckets := make([]uint32, header.Nbuckets)
-		if _, err := r.File.Seek(int64(bucketsOffset), io.SeekStart); err != nil {
+		if _, err := r.File.Seek(int64(r.vaddrToOffset(bucketsAddr)), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("gnu_hash:buckets_seek | %w", err)
 		}
 		if err := binary.Read(r.File, binary.LittleEndian, buckets); err != nil {
@@ -526,7 +553,8 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 		currentSymIndex := uint64(maxBucketIndex)
 		for currentSymIndex < 1000000 {
 			chainIndex := currentSymIndex - uint64(header.Symndx)
-			if _, err := r.File.Seek(int64(chainsOffset+chainIndex*4), io.SeekStart); err != nil {
+			chainFileOffset := r.vaddrToOffset(chainsAddr + chainIndex*4)
+			if _, err := r.File.Seek(int64(chainFileOffset), io.SeekStart); err != nil {
 				return currentSymIndex, nil
 			}
 
@@ -551,7 +579,8 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 // calculateHashSizes determines the exact size of .hash and .gnu.hash sections
 func (r *ElfReader) calculateHashSizes() {
 	if r.hashOffset != 0 {
-		if _, err := r.File.Seek(int64(r.hashOffset), io.SeekStart); err == nil {
+		fileOffset := r.vaddrToOffset(r.hashOffset)
+		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err == nil {
 			var header HashHeader
 			if err := binary.Read(r.File, binary.LittleEndian, &header); err == nil {
 				// size = header (8) + buckets (nbucket * 4) + chains (nchain * 4)
@@ -562,7 +591,8 @@ func (r *ElfReader) calculateHashSizes() {
 	}
 
 	if r.gnuHashOffset != 0 {
-		if _, err := r.File.Seek(int64(r.gnuHashOffset), io.SeekStart); err == nil {
+		fileOffset := r.vaddrToOffset(r.gnuHashOffset)
+		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err == nil {
 			var header GNUHashHeader
 			if err := binary.Read(r.File, binary.LittleEndian, &header); err == nil {
 				// size = header (16) + bloom filter (maskwords * 8) + buckets (nbuckets * 4) + chains
@@ -663,20 +693,21 @@ func (r *ElfReader) readStrtabString(nameOffset uint32) string {
 		return ""
 	}
 
+	fileOffset := r.vaddrToOffset(r.strtabOffset + uint64(nameOffset))
+
 	fileInfo, err := r.File.Stat()
 	if err != nil {
 		logger.Warn("strtab:read | stat failed", "error", err)
 		return ""
 	}
 
-	offset := r.strtabOffset + uint64(nameOffset)
-	if offset >= uint64(fileInfo.Size()) {
-		logger.Warn("strtab:read | offset out of bounds", "offset", offset, "size", fileInfo.Size())
+	if fileOffset >= uint64(fileInfo.Size()) {
+		logger.Warn("strtab:read | offset out of bounds", "offset", fileOffset, "size", fileInfo.Size())
 		return ""
 	}
 
-	if _, err = r.File.Seek(int64(offset), io.SeekStart); err != nil {
-		logger.Warn("strtab:read | seek failed", "offset", offset, "error", err)
+	if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
+		logger.Warn("strtab:read | seek failed", "offset", fileOffset, "error", err)
 		return ""
 	}
 
@@ -689,11 +720,11 @@ func (r *ElfReader) readStrtabString(nameOffset uint32) string {
 			break
 		}
 		if n == 0 {
-			logger.Warn("strtab:read | end of file", "offset", offset)
+			logger.Warn("strtab:read | end of file", "offset", fileOffset)
 			break
 		}
 		if err != nil {
-			logger.Warn("strtab:read | read failed", "offset", offset, "error", err)
+			logger.Warn("strtab:read | read failed", "offset", fileOffset, "error", err)
 			break
 		}
 		result = append(result, buf[0])
