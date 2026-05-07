@@ -528,16 +528,12 @@ func (t SymbolType) Text() string {
 }
 
 // Helper functions for symbol info
-func (s Elf64_Sym) stBind() SymbolBinding {
+func (s Elf64_Sym) StBind() SymbolBinding {
 	return SymbolBinding(s.St_Info >> 4)
 }
 
-func (s Elf64_Sym) stType() SymbolType {
+func (s Elf64_Sym) StType() SymbolType {
 	return SymbolType(s.St_Info & 0xf)
-}
-
-func (s Elf64_Sym) stInfo() uint8 {
-	return (uint8(s.stBind()) << 4) | (uint8(s.stType()) & 0xf)
 }
 
 func (r Elf64_Rel) Type() RelocationType {

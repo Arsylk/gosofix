@@ -29,7 +29,7 @@ func NewElfRebuilder(reader *ElfReader, outputPath string) (*ElfRebuilder, error
 	}
 
 	var err error
-	rebuilder.OutFile, err = os.OpenFile(outputPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
+	rebuilder.OutFile, err = os.OpenFile(outputPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -107,15 +107,15 @@ func (r *ElfRebuilder) WriteFixedElf() error {
 		return fmt.Errorf("failed to patch dynamic section: %w", err)
 	}
 
-	// Patch symbol table in place
+	// Build and write section headers first (populates r.sections)
+	if err := r.writeSectionHeaders(); err != nil {
+		return fmt.Errorf("failed to write section headers: %w", err)
+	}
+
+	// Now that sections exist, fix symbol section indices
 	r.fixSymbolSectionIndices()
 	if err := r.writeSymbolTable(); err != nil {
 		return fmt.Errorf("failed to patch symbols: %w", err)
-	}
-
-	// Build and write section headers
-	if err := r.writeSectionHeaders(); err != nil {
-		return fmt.Errorf("failed to write section headers: %w", err)
 	}
 
 	// Patch leftover absolute in-module pointers not covered by relocation metadata
@@ -221,7 +221,7 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 		symSize := r.symCount * 24
 		firstGlobalIdx := uint32(1)
 		for i, sym := range r.Symbols {
-			if sym.stBind() != STB_LOCAL {
+			if sym.StBind() != STB_LOCAL {
 				firstGlobalIdx = uint32(i)
 				break
 			}
@@ -561,29 +561,9 @@ func (r *ElfRebuilder) findAuthoritativeSectionForAddr(addr uint64) uint16 {
 
 // writeFixedInitsFinis writes addresses for init_array & finit_array
 func (r *ElfRebuilder) writeFixedInitsFinis() error {
-	if r.initOffset != 0 {
-		fileOffset := r.vaddrToOffset(r.initOffset)
-		value := r.readUint64OutAt(fileOffset)
-		newVal := r.normalizeValue(value)
-		if newVal != value {
-			if err := r.writeAtOffset(fileOffset, newVal); err != nil {
-				return fmt.Errorf("failed to write init: %w", err)
-			}
-			logger.Debug("init write", "offset", fileOffset, "value", newVal)
-		}
-	}
-
-	if r.finiOffset != 0 {
-		fileOffset := r.vaddrToOffset(r.finiOffset)
-		value := r.readUint64OutAt(fileOffset)
-		newVal := r.normalizeValue(value)
-		if newVal != value {
-			if err := r.writeAtOffset(fileOffset, newVal); err != nil {
-				return fmt.Errorf("failed to write fini: %w", err)
-			}
-			logger.Debug("fini write", "offset", fileOffset, "value", newVal)
-		}
-	}
+	// DT_INIT and DT_FINI are already normalized as dynamic tag values
+	// in ReadDyns. The values ARE the function addresses — we must not
+	// read or modify bytes at those addresses (they contain code, not pointers).
 
 	if r.initArraySize > 0 && r.initArrayOffset != 0 {
 		initArrayCount := r.initArraySize / 8
@@ -626,6 +606,11 @@ func (r *ElfRebuilder) writeFixedInitsFinis() error {
 func (r *ElfRebuilder) writeFixedRelocs() error {
 	// Fix REL relocations - write to target locations
 	for i, rel := range r.Rel {
+		relocType := rel.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("rel skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		// rel.Offset is already normalized to relative Vaddr
 		targetFileOffset, err := r.relocationTargetOffset(rel.Offset)
 		if err != nil {
@@ -640,6 +625,11 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 
 	// Fix RELA relocations - write to target locations
 	for i, rela := range r.Rela {
+		relocType := rela.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("rela skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		targetFileOffset, err := r.relocationTargetOffset(rela.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to map rela target at idx %d: %w", i, err)
@@ -653,6 +643,11 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 
 	// Fix JmpRel relocations - write to target locations
 	for i, rel := range r.JmpRel {
+		relocType := rel.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("jmprel skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		targetFileOffset, err := r.relocationTargetOffset(rel.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to map jmprel target at idx %d: %w", i, err)
@@ -666,6 +661,11 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 
 	// Fix JmpRela relocations - write to target locations
 	for i, rela := range r.JmpRela {
+		relocType := rela.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("jmprela skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		targetFileOffset, err := r.relocationTargetOffset(rela.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to map jmprela target at idx %d: %w", i, err)
@@ -679,6 +679,11 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 
 	// Fix Android REL relocations
 	for i, rel := range r.AndroidRel {
+		relocType := rel.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("android_rel skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		targetFileOffset, err := r.relocationTargetOffset(rel.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to map android_rel target at idx %d: %w", i, err)
@@ -692,6 +697,11 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 
 	// Fix Android RELA relocations
 	for i, rela := range r.AndroidRela {
+		relocType := rela.Type()
+		if !isDataRelocation(relocType) {
+			logger.Debug("android_rela skip", "index", i, "type", relocType.Text(), "reason", "unsupported_or_none")
+			continue
+		}
 		targetFileOffset, err := r.relocationTargetOffset(rela.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to map android_rela target at idx %d: %w", i, err)
@@ -751,8 +761,8 @@ func (r *ElfRebuilder) patchRelrAt(vaddr uint64) error {
 		return err
 	}
 	currentVal := r.readUint64OutAt(fileOffset)
-	if r.BaseAddr != 0 && currentVal >= r.BaseAddr {
-		newVal := currentVal - r.BaseAddr
+	newVal := r.normalizeValue(currentVal)
+	if newVal != currentVal {
 		if err := r.writeAtOffset(fileOffset, newVal); err != nil {
 			return fmt.Errorf("failed to write relr: %w", err)
 		}
@@ -792,13 +802,20 @@ func (r *ElfRebuilder) writeDynamicSection() error {
 	return nil
 }
 
-func isNullPlaceholderSymbol(sym Elf64_Sym) bool {
-	return sym.St_Name == 0 &&
-		sym.St_Value == 0 &&
-		sym.St_Size == 0 &&
-		sym.St_Info == 0 &&
-		sym.St_Other == 0 &&
-		sym.St_Shndx == 0
+// isDataRelocation returns true for 64-bit data relocation types that modify
+// an 8-byte slot. Code relocations (ADR, CALL26, etc.) modify 4-byte
+// instructions and must not be treated as 8-byte writes.
+func isDataRelocation(rt RelocationType) bool {
+	switch rt {
+	case R_AARCH64_NONE:
+		return false
+	case R_AARCH64_ABS64, R_AARCH64_PREL64, R_AARCH64_RELATIVE,
+		R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_COPY,
+		R_AARCH64_TLS_DTPMOD, R_AARCH64_TLS_DTPREL:
+		return true
+	default:
+		return false
+	}
 }
 
 // computeRelValue computes the fixed value for a REL relocation
@@ -807,15 +824,11 @@ func (r *ElfRebuilder) computeRelValue(rel *Elf64_Rel, fileOffset uint64) uint64
 	relocSym := rel.Sym()
 
 	var S uint64
-	useSymIndexAsValue := false
 	if relocSym < uint32(len(r.Symbols)) {
 		sym := r.Symbols[relocSym]
 		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
-		logger.Debug("rel resolve", "symbol", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		logger.Debug("rel resolve", "symbol", symName, "type", sym.StType().Text(), "bind", sym.StBind().Text())
 		S = sym.St_Value
-		if isNullPlaceholderSymbol(sym) && relocSym != 0 {
-			useSymIndexAsValue = true
-		}
 	}
 
 	switch relocType {
@@ -827,9 +840,6 @@ func (r *ElfRebuilder) computeRelValue(rel *Elf64_Rel, fileOffset uint64) uint64
 		currentVal := r.readUint64OutAt(fileOffset)
 		return r.normalizeValue(currentVal)
 	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64:
-		if useSymIndexAsValue {
-			return uint64(relocSym)
-		}
 		currentVal := r.readUint64OutAt(fileOffset)
 		return r.normalizeValue(currentVal)
 	case R_AARCH64_TLS_DTPMOD:
@@ -853,17 +863,12 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela, fileOffset uint64) uin
 	relocType := rela.Type()
 	relocSym := rela.Sym()
 
-	// Keep S as int64 for proper signed arithmetic with addend
 	var S int64
-	useSymIndexAsValue := false
 	if relocSym < uint32(len(r.Symbols)) {
 		sym := r.Symbols[relocSym]
 		symName := DemangleSymbol(r.readStrtabString(sym.St_Name))
-		logger.Debug("rela resolve", "symbol", symName, "type", sym.stType().Text(), "bind", sym.stBind().Text())
+		logger.Debug("rela resolve", "symbol", symName, "type", sym.StType().Text(), "bind", sym.StBind().Text())
 		S = int64(sym.St_Value)
-		if isNullPlaceholderSymbol(sym) && relocSym != 0 {
-			useSymIndexAsValue = true
-		}
 	}
 
 	A := rela.Addend // Keep as int64
@@ -876,9 +881,6 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela, fileOffset uint64) uin
 		currentVal := r.readUint64OutAt(fileOffset)
 		return r.normalizeValue(currentVal)
 	case R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_ABS64:
-		if useSymIndexAsValue {
-			return uint64(int64(relocSym) + A)
-		}
 		currentVal := r.readUint64OutAt(fileOffset)
 		return r.normalizeValue(currentVal)
 	case R_AARCH64_PREL64:
@@ -1006,7 +1008,7 @@ func (r *ElfRebuilder) patchResidualBasePointers() error {
 				continue
 			}
 
-			val := r.ElfReader.readUint64At(off)
+			val := r.readUint64OutAt(off)
 			if val < r.BaseAddr || val >= r.BaseAddr+r.TotalSize {
 				continue
 			}
@@ -1028,6 +1030,11 @@ func (r *ElfRebuilder) patchResidualBasePointers() error {
 		}
 	}
 	for _, phdr := range r.Phdrs {
+		// Skip executable segments — scanning .text for 8-byte-aligned pointer-like values
+		// risks corrupting instruction immediates and literal pool constants.
+		if (phdr.Flags & PF_X) != 0 {
+			continue
+		}
 		performCheck(phdr.Offset, phdr.Offset+phdr.Filesz)
 	}
 

@@ -25,7 +25,7 @@ target("libgosofix")
 -- DL Test Utility (C)
 target("test_dl")
     set_kind("binary")
-    add_files("tests/test_dl.c")
+    add_files("samples/test_dl.c")
     add_syslinks("dl")
     set_targetdir("dist")
 
@@ -79,14 +79,14 @@ task("test")
         -- Selected for diversity in size, relocation types, and structure
         print("\n\27[1m=== Phase 2: Sample Regression ===\27[0m")
         local samples = {
-            { file = "tests/libjiagu.so_dump_0x759b2b2000.so",            tag = "jiagu-3MB-rela+jmprel" },
-            { file = "tests/libdexprotector.so_dump_0x6ddc6d8000.so",      tag = "dexprotect-412K-rela+hash" },
-            { file = "tests/saitcza.so_dump_0x76c8436000.so",              tag = "obfuscated-2.3MB" },
-            { file = "tests/libstubiest.so_dump_0x7572b00000.so",          tag = "minimal-252K" },
-            { file = "tests/libSt9w.so_dump_0x7366c6e000.so",             tag = "corrupt-shdrs-1.4MB" },
-            { file = "tests/libriskdetector.so_dump_0x6f3d8f4000.so",      tag = "riskdetector-569K" },
-            { file = "tests/libhunter.so_dump_0x6bfda14000.so",            tag = "hunter-3.8MB" },
-            { file = "tests/libuseard.so_dump_0x71fcfa8000.so",            tag = "useard-287K" },
+            { file = "samples/libjiagu.so_dump_0x759b2b2000.so",            tag = "jiagu-3MB-rela+jmprel" },
+            { file = "samples/libdexprotector.so_dump_0x6ddc6d8000.so",      tag = "dexprotect-412K-rela+hash" },
+            { file = "samples/saitcza.so_dump_0x76c8436000.so",              tag = "obfuscated-2.3MB" },
+            { file = "samples/libstubiest.so_dump_0x7572b00000.so",          tag = "minimal-252K" },
+            { file = "samples/libSt9w.so_dump_0x7366c6e000.so",             tag = "corrupt-shdrs-1.4MB" },
+            { file = "samples/libriskdetector.so_dump_0x6f3d8f4000.so",      tag = "riskdetector-569K" },
+            { file = "samples/libhunter.so_dump_0x6bfda14000.so",            tag = "hunter-3.8MB" },
+            { file = "samples/libuseard.so_dump_0x71fcfa8000.so",            tag = "useard-287K" },
         }
 
         local passed, failed = 0, 0
@@ -133,8 +133,24 @@ task("test")
             end
         end
 
-        -- Phase 3: dlopen test
-        print("\n\27[1m=== Phase 3: Library Interface ===\27[0m")
+        -- Phase 3: Go unit + integration tests
+        print("\n\27[1m=== Phase 3: Go Test Suite ===\27[0m")
+        log_info("test:go", "package", "./test/")
+        try {
+            function()
+                os.execv("go", { "test", "./test/", "-count=1" })
+            end,
+            catch {
+                function(e)
+                    log_fail("test:go FAILED", "err", tostring(e))
+                    os.exit(1)
+                end
+            }
+        }
+        log_success("go test passed")
+
+        -- Phase 4: dlopen test
+        print("\n\27[1m=== Phase 4: Library Interface ===\27[0m")
         local test_dl = path.join("dist", "test_dl")
         log_info("test:dlopen", "lib", libgosofix)
         os.execv(test_dl, { libgosofix, samples[1].file })

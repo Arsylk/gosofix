@@ -261,7 +261,19 @@ func (r *ElfReader) ReadDyns() error {
 
 	if dynamicPhdr == nil {
 		logger.Warn("dyn missing", "detail", "missing pt_dynamic")
+		// Even without PT_DYNAMIC, try reading from file beg
 		return nil
+	}
+
+	// Ensure dynamic section data is sizable
+	if dynamicPhdr.Memsz == 0 {
+		// Some dumps have PT_DYNAMIC with zero size — use p_filesz if available
+		if dynamicPhdr.Filesz > 0 {
+			dynamicPhdr.Memsz = dynamicPhdr.Filesz
+		} else {
+			logger.Warn("dyn empty", "detail", "pt_dynamic has zero size")
+			return nil
+		}
 	}
 
 	entryCount := dynamicPhdr.Memsz / uint64(binary.Size(Elf64_Dyn{}))
@@ -284,7 +296,8 @@ func (r *ElfReader) ReadDyns() error {
 
 	// Build map and extract essential fields for rebuilder
 	r.dynMap = make(map[DT_Tag]uint64)
-	for _, entry := range r.Dyns {
+	for i := range r.Dyns {
+		entry := &r.Dyns[i]
 		val := entry.Val
 
 		// Normalize addresses relative to base
@@ -294,6 +307,9 @@ func (r *ElfReader) ReadDyns() error {
 				val -= r.BaseAddr
 			}
 		}
+
+		// Write back normalized value to Dyns for later serialization
+		entry.Val = val
 
 		// Only extract fields actually used by the rebuilder
 		switch entry.Tag {
@@ -439,7 +455,7 @@ func (r *ElfReader) readSymbols() error {
 	for i := range r.Symbols {
 		sym := &r.Symbols[i]
 		// TLS symbols have st_value relative to TLS block, not vaddr — skip normalization
-		if r.BaseAddr != 0 && sym.St_Value >= r.BaseAddr && sym.stType() != STT_TLS {
+		if r.BaseAddr != 0 && sym.St_Value >= r.BaseAddr && sym.StType() != STT_TLS {
 			sym.St_Value -= r.BaseAddr
 		}
 	}
@@ -580,12 +596,17 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 			return 0, fmt.Errorf("gnu_hash:read | %w", err)
 		}
 
+		// Guard against corrupt headers that would allocate excessive memory
+		if header.Nbuckets > 65536 || header.Maskwords > 65536 {
+			return 0, fmt.Errorf("gnu_hash:corrupt nbuckets=%d maskwords=%d", header.Nbuckets, header.Maskwords)
+		}
+
 		// Calculate bloom filter size
 		bloomSize := uint64(header.Maskwords) * 8
 		bucketsAddr := r.gnuHashOffset + 16 + bloomSize
 		chainsAddr := bucketsAddr + uint64(header.Nbuckets)*4
 
-		// Read buckets to find max symbol index
+		// Read buckets
 		buckets := make([]uint32, header.Nbuckets)
 		if _, err := r.File.Seek(int64(r.vaddrToOffset(bucketsAddr)), io.SeekStart); err != nil {
 			return 0, fmt.Errorf("gnu_hash:buckets_seek | %w", err)
@@ -594,40 +615,53 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 			return 0, fmt.Errorf("gnu_hash:buckets_read | %w", err)
 		}
 
-		// Find max bucket index
-		maxBucketIndex := uint32(0)
+		// Scan ALL non-zero bucket chains to find the true maximum symbol index.
+		// A bucket with a lower starting index can have a longer chain that extends
+		// past the highest bucket's starting index.
+		maxSymIdx := uint64(header.Symndx)
+		seenBuckets := make(map[uint32]bool)
+
 		for _, bptr := range buckets {
-			if bptr > maxBucketIndex {
-				maxBucketIndex = bptr
+			if bptr == 0 || seenBuckets[bptr] {
+				continue
+			}
+			seenBuckets[bptr] = true
+
+			currentSymIndex := uint64(bptr)
+			for currentSymIndex < 1000000 {
+				if currentSymIndex > maxSymIdx {
+					maxSymIdx = currentSymIndex
+				}
+				chainIndex := currentSymIndex - uint64(header.Symndx)
+				chainFileOffset := r.vaddrToOffset(chainsAddr + chainIndex*4)
+
+				// Bound check: don't read past file
+				fileInfo, _ := r.File.Stat()
+				if fileInfo != nil && chainFileOffset+4 > uint64(fileInfo.Size()) {
+					break
+				}
+
+				if _, err := r.File.Seek(int64(chainFileOffset), io.SeekStart); err != nil {
+					break
+				}
+				var chainVal uint32
+				if err := binary.Read(r.File, binary.LittleEndian, &chainVal); err != nil {
+					break
+				}
+
+				// Bit 0 = 1 marks end of chain
+				if (chainVal & 1) != 0 {
+					currentSymIndex++
+					if currentSymIndex > maxSymIdx {
+						maxSymIdx = currentSymIndex
+					}
+					break
+				}
+				currentSymIndex++
 			}
 		}
 
-		if maxBucketIndex == 0 {
-			return uint64(header.Symndx), nil
-		}
-
-		// Follow chain to find highest symbol index
-		currentSymIndex := uint64(maxBucketIndex)
-		for currentSymIndex < 1000000 {
-			chainIndex := currentSymIndex - uint64(header.Symndx)
-			chainFileOffset := r.vaddrToOffset(chainsAddr + chainIndex*4)
-			if _, err := r.File.Seek(int64(chainFileOffset), io.SeekStart); err != nil {
-				return currentSymIndex, nil
-			}
-
-			var chainVal uint32
-			if err := binary.Read(r.File, binary.LittleEndian, &chainVal); err != nil {
-				return currentSymIndex, nil
-			}
-
-			// Bit 0 = 1 marks end of chain
-			if (chainVal & 1) != 0 {
-				return currentSymIndex + 1, nil
-			}
-			currentSymIndex++
-		}
-
-		return currentSymIndex + 1, nil
+		return maxSymIdx + 1, nil
 	}
 
 	return 0, fmt.Errorf("sym:count | missing DT_HASH or DT_GNU_HASH")
@@ -768,20 +802,21 @@ func (r *ElfReader) readStrtabString(nameOffset uint32) string {
 		return ""
 	}
 
+	// Bound reads to strtabSize to avoid infinite loops on corrupted strings.
+	maxLen := r.strtabSize
+	if maxLen == 0 || maxLen > 65536 {
+		maxLen = 65536
+	}
+
 	var result []byte
 	buf := make([]byte, 1)
 
-	for {
+	for uint64(len(result)) < maxLen {
 		n, err := r.File.Read(buf)
+		if n == 0 || err != nil {
+			break
+		}
 		if buf[0] == 0 {
-			break
-		}
-		if n == 0 {
-			logger.Warn("strtab read", "reason", "end of file", "offset", fileOffset)
-			break
-		}
-		if err != nil {
-			logger.Warn("strtab read", "reason", "read failed", "offset", fileOffset, "error", err)
 			break
 		}
 		result = append(result, buf[0])
@@ -848,11 +883,22 @@ func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Re
 			result = append(result, rela)
 		}
 	} else {
-		// APS2 format: grouped relocations
+		// APS2 format: count, initial_offset, then grouped relocations
 		relocCount, n := decodeSLEB128(buf[pos:])
 		pos += n
-		var offset int64
+
+		// BUGFIX: Read initial offset after count (was previously skipped)
+		initialOffset, n := decodeSLEB128(buf[pos:])
+		pos += n
+		var offset int64 = initialOffset
 		var addend int64
+
+		const (
+			groupedByInfo        = 1 // RELOCATION_GROUPED_BY_INFO_FLAG
+			groupedByOffsetDelta = 2 // RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+			groupedByAddend      = 4 // RELOCATION_GROUPED_BY_ADDEND_FLAG
+			groupHasAddend       = 8 // RELOCATION_GROUP_HAS_ADDEND_FLAG
+		)
 
 		for len(result) < int(relocCount) && pos < len(buf) {
 			// Read group header
@@ -860,12 +906,6 @@ func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Re
 			pos += n1
 			groupFlags, n2 := decodeSLEB128(buf[pos:])
 			pos += n2
-
-			const (
-				groupedByInfo        = 1
-				groupedByOffsetDelta = 2
-				groupedByAddend      = 4
-			)
 
 			// Read group-level shared values
 			var groupOffsetDelta int64
@@ -880,11 +920,20 @@ func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Re
 				pos += n
 			}
 
-			var groupAddend int64
-			if (groupFlags & groupedByAddend) != 0 {
-				groupAddend, n = decodeSLEB128(buf[pos:])
-				pos += n
-				addend = groupAddend
+			// BUGFIX: Only read addend when groupHasAddend flag is set.
+			// If flag 8 is clear, entries have NO addends at all.
+			entriesHaveAddends := (groupFlags & groupHasAddend) != 0
+
+			if entriesHaveAddends {
+				if (groupFlags & groupedByAddend) != 0 {
+					// All entries share the same addend
+					groupAddend, n := decodeSLEB128(buf[pos:])
+					pos += n
+					addend = groupAddend
+				} else {
+					// No group addend; per-entry deltas starting from 0
+					addend = 0
+				}
 			} else {
 				addend = 0
 			}
@@ -908,7 +957,7 @@ func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Re
 					pos += n
 				}
 
-				if (groupFlags & groupedByAddend) == 0 {
+				if entriesHaveAddends && (groupFlags&groupedByAddend) == 0 {
 					var addendDelta int64
 					addendDelta, n = decodeSLEB128(buf[pos:])
 					pos += n
@@ -978,21 +1027,25 @@ func (r *ElfReader) decodePackedRel(fileOffset uint64, size uint64) ([]Elf64_Rel
 			}
 		}
 	} else {
-		// APS2: same group format as RELA but without addends
+		// APS2: count, initial_offset, then grouped relocations (no addends)
 		relocCount, n := decodeSLEB128(buf[pos:])
 		pos += n
-		var offset int64
+
+		// BUGFIX: Read initial offset after count (was previously skipped)
+		initialOffset, n := decodeSLEB128(buf[pos:])
+		pos += n
+		var offset int64 = initialOffset
+
+		const (
+			groupedByInfo        = 1 // RELOCATION_GROUPED_BY_INFO_FLAG
+			groupedByOffsetDelta = 2 // RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+		)
 
 		for len(result) < int(relocCount) && pos < len(buf) {
 			groupSize, n1 := decodeSLEB128(buf[pos:])
 			pos += n1
 			groupFlags, n2 := decodeSLEB128(buf[pos:])
 			pos += n2
-
-			const (
-				groupedByInfo        = 1
-				groupedByOffsetDelta = 2
-			)
 
 			var groupOffsetDelta int64
 			if (groupFlags & groupedByOffsetDelta) != 0 {
