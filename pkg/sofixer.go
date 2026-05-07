@@ -15,6 +15,7 @@ import (
 var (
 	// Logger instance with custom styles
 	logger *log.Logger
+	Logger *log.Logger
 	styles *log.Styles
 )
 
@@ -25,23 +26,23 @@ func init() {
 	// Symbolic prefixes with strict color coding
 	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
 		SetString("[?]").
-		Foreground(lipgloss.Color("243")) // grey - trace/debug
+		Foreground(lipgloss.Color("#6c7086"))
 	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().
 		SetString("[+]").
-		Foreground(lipgloss.Color("86")) // cyan - success/info
+		Foreground(lipgloss.Color("#74c7ec"))
 	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().
 		SetString("[!]").
-		Foreground(lipgloss.Color("221")) // yellow - warning
+		Foreground(lipgloss.Color("#f9e2af"))
 	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
 		SetString("[x]").
-		Foreground(lipgloss.Color("#f38ba8")) // red - error
+		Foreground(lipgloss.Color("#f38ba8"))
 
 	// Style for keys and values
-	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe"))
 
 	// Address values get orange highlight
-	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "final_va", "range1", "range2", "e_shoff", "start"} {
+	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "start", "handle", "mmap_addr", "mmap_region", "input_path", "output_path", "path"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Transform(func(s string) string {
 			if num, err := strconv.ParseUint(s, 0, 64); err == nil {
 				return fmt.Sprintf("0x%x", num)
@@ -50,19 +51,19 @@ func init() {
 		})
 	}
 	// Numbers get magenta
-	for _, key := range []string{"idx", "size", "memsz", "filesz", "count", "e_shnum", "e_shstrndx", "phentsize", "entries", "totalSize"} {
+	for _, key := range []string{"index", "size", "memory_size", "file_size", "count", "entry_count", "entries", "total_size", "expected_count", "actual_count", "decoded_count", "section_count", "symbol_count", "program_header_count"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#CBA6F7"))
 	}
 	// Type tags get blue bold
-	for _, key := range []string{"type", "tag", "reloc", "bind", "flags"} {
+	for _, key := range []string{"type", "tag", "reloc", "bind", "flags", "level"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
 	}
 	// File paths get yellow
-	for _, key := range []string{"file", "path", "runpath", "outpath"} {
+	for _, key := range []string{"file", "path", "runpath", "input_path", "output_path"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
 	}
 	// Names get green
-	for _, key := range []string{"name", "sym", "lib", "section", "section1", "section2"} {
+	for _, key := range []string{"name", "symbol", "sym", "lib", "library", "section", "section1", "section2", "package", "tag"} {
 		styles.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	}
 
@@ -71,6 +72,7 @@ func init() {
 		ReportCaller:    false,
 	})
 	logger.SetStyles(styles)
+	Logger = logger
 }
 
 // FixELFHeaders attempts to fix common issues with ELF headers.
@@ -86,7 +88,7 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 	default:
 		logger.SetLevel(log.InfoLevel)
 	}
-	logger.Info("elf:fix", "file", filePath, "base", baseAddr)
+	logger.Info("elf fix", "path", filePath, "base", baseAddr)
 
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
@@ -109,17 +111,21 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 	if err != nil {
 		return fmt.Errorf("failed to create rebuilder: %w", err), ""
 	}
-	defer rebuilder.OutFile.Close()
 
 	err = rebuilder.WriteFixedElf()
+	rebuilder.OutFile.Close()
 	if err != nil {
-		logger.Error("elf:fin", "err", err, "outpath", outputPath)
+		logger.Error("elf fin", "error", err, "output_path", outputPath)
 		return err, ""
 	}
-	logger.Info("elf:fin success", "outpath", outputPath)
 
-	successMsg := styles.Message.Render("elf:fin", "outpath", outputPath)
-	return nil, successMsg
+	// Post-fix verification on the closed output file
+	if info, statErr := os.Stat(outputPath); statErr == nil {
+		CheckFixedElf(outputPath, baseAddr, uint64(info.Size()))
+	}
+
+	logger.Info("elf fin", "output_path", outputPath)
+	return nil, "elf fin output_path=" + outputPath
 }
 
 // readArray reads up to 'count' elements of type T from file at the given offset.
@@ -151,7 +157,7 @@ func readArray[T any](file *os.File, offset uint64, count uint64, name string) (
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				// Return what we have so far
 				if len(result) > 0 {
-					logger.Warn("partial read", "name", name, "expected", count, "got", len(result))
+					logger.Warn("partial read", "name", name, "expected_count", count, "actual_count", len(result))
 				}
 				return result, nil
 			}

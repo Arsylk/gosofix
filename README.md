@@ -8,13 +8,16 @@
 
 gosofix processes memory-dumped `.so` files from Android processes and normalizes them back to valid ELF files that can be analyzed in tools like IDA Pro, Ghidra, or Binary Ninja.
 
-## ✨ Features
+### Key Features
 
-- **Base address normalization** — Converts absolute virtual addresses back to relative offsets
-- **Relocation processing** — Fixes `R_AARCH64_RELATIVE`, `GLOB_DAT`, `JUMP_SLOT`, and other relocation types
-- **Section header reconstruction** — Rebuilds section headers from dynamic segment information
-- **Symbol table fixing** — Normalizes symbol values and section indices
-- **Init/Fini array patching** — Corrects constructor/destructor function pointers
+- **ELF 64-bit ARM64 Support**: Specialized for Android shared objects.
+- **Robust Relocation Normalization**: Handles `ABS64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE` relocations. Automatically detects and normalizes "dirty" addends in memory dumps (absolute pointers poisoned by runtime linkers).
+- **Accurate PC-Relative Fixes**: Properly handles `R_AARCH64_PREL64` using virtual addresses.
+- **APS2/APA1 & RELR Support**: Full support for Android packed relocations (SLEB128 and bitmap formats).
+- **Preserved Runtime Data**: Reconstructs `.bss` as `PROGBITS` to preserve values initialized at runtime (e.g., by packers).
+- **Intelligent Section Reconstruction**: Automatically identifies gaps between known structures and creates descriptive placeholder sections (`.text.gap_N`, `.data.gap_N`) to ensure full coverage in static analysis tools.
+- **Post-Fix Verification**: Built-in sanity checker validates headers, segment consistency, and scans for residual absolute addresses.
+- **Page Alignment Support**: Detects and maintains 4KB/16KB/64KB alignment found in dumped segments.
 - **Dual interface** — Available as CLI binary and shared library (for integration via `dlopen`)
 
 ## 📦 Installation
@@ -93,11 +96,11 @@ free(result);
 ## 📖 How It Works
 
 When a shared library is loaded into an Android process, the dynamic linker:
-1. Maps the file at a runtime base address
+1. Maps the file at a runtime base address (ASLR)
 2. Applies relocations (fixing up pointers with the base address)
-3. Runs initializers
+3. Initializes `.bss` and runs constructors
 
-Memory dumps capture the **post-relocation** state. gosofix reverses this:
+Memory dumps capture the **post-relocation** state with live runtime data. gosofix reverses this:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -105,16 +108,16 @@ Memory dumps capture the **post-relocation** state. gosofix reverses this:
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │ Entry: 0x7abc125000  (base + 0x2000)                 │      │
 │  │ GOT[0]: 0x7abc130000 (base + actual_offset)          │      │
-│  │ init_array[0]: 0x7abc12f000                          │      │
+│  │ .bss globals: live runtime values                    │      │
 │  └──────────────────────────────────────────────────────┘      │
 │                           │                                     │
-│                           ▼  gosofix (subtract base 0x7abc123000)│
+│                           ▼  gosofix                            │
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │ Entry: 0x2000                                        │      │
 │  │ GOT[0]: 0xd000                                       │      │
-│  │ init_array[0]: 0xc000                                │      │
+│  │ .bss globals: preserved as SHT_PROGBITS              │      │
 │  └──────────────────────────────────────────────────────┘      │
-│  Fixed ELF (relative offsets)                                   │
+│  Fixed ELF (relative offsets, runtime data preserved)           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -126,9 +129,12 @@ Memory dumps capture the **post-relocation** state. gosofix reverses this:
 | Program Headers (`p_vaddr`, `p_paddr`) | Normalize virtual addresses |
 | Dynamic Section | Normalize address tags (`DT_STRTAB`, `DT_SYMTAB`, etc.) |
 | Symbol Table (`st_value`) | Normalize symbol addresses |
-| Relocations | Apply inverse relocation for target locations |
+| Standard Relocations (RELA/REL) | Apply inverse relocation for target locations |
+| Packed Relocations (APS2/APA1) | Decode SLEB128 stream, normalize targets |
+| RELR Bitmap Relocations | Decode bitmap entries, normalize targets |
 | Init/Fini Arrays | Normalize function pointers |
-| Section Headers | Reconstruct from dynamic information |
+| `.bss` / Runtime Data | Preserved as-is (not zeroed) |
+| Section Headers | Reconstructed from dynamic information |
 
 ## ⚠️ Limitations
 
@@ -139,12 +145,15 @@ Memory dumps capture the **post-relocation** state. gosofix reverses this:
 ## 🔬 Testing
 
 ```bash
-# Run full test suite
+# Run full test suite (5 diverse samples + build verification)
 xmake test
-
-# Or use the bulk test script
-./run_all_tests.sh
 ```
+
+The test suite covers samples with varying characteristics:
+- Different packers (Jiagu, DexProtector, custom)
+- Varying sizes (252KB to 3MB)
+- Different relocation configurations
+- Corrupted/missing section headers in dumps
 
 ## 📄 License
 

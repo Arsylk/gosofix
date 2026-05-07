@@ -168,6 +168,9 @@ const (
 	SHT_GNU_HASH    SHT_Type = 0x6ffffff6
 	SHT_GNU_VERNEED SHT_Type = 0x6ffffffe
 	SHT_GNU_VERSYM  SHT_Type = 0x6fffffff
+	SHT_ANDROID_RELA SHT_Type = 0x60000001
+	SHT_ANDROID_REL  SHT_Type = 0x60000002
+	SHT_RELR         SHT_Type = 0x6fffff00
 )
 
 type DT_Tag uint64
@@ -208,8 +211,16 @@ const (
 	DT_RELACOUNT       DT_Tag = 0x6ffffff9
 	DT_RELCOUNT        DT_Tag = 0x6ffffffa
 	DT_FLAGS_1         DT_Tag = 0x6ffffffb
-	DT_VERNEED         DT_Tag = 0x6ffffffe
-	DT_VERNEEDNUM      DT_Tag = 0x6fffffff
+	DT_VERNEED        DT_Tag = 0x6ffffffe
+	DT_VERNEEDNUM     DT_Tag = 0x6fffffff
+	DT_ANDROID_REL    DT_Tag = 0x6000000f
+	DT_ANDROID_RELSZ  DT_Tag = 0x60000010
+	DT_ANDROID_RELA   DT_Tag = 0x60000011
+	DT_ANDROID_RELASZ DT_Tag = 0x60000012
+	DT_RELR           DT_Tag = 0x6fffff00
+	DT_RELRSZ         DT_Tag = 0x6fffff01
+	DT_RELRENT        DT_Tag = 0x6fffff03
+	DT_RELRCOUNT      DT_Tag = 0x6fffff05
 )
 
 // Elf64_Verneed represents GNU symbol version requirements
@@ -307,6 +318,12 @@ func (t SHT_Type) Text() string {
 		return "SHT_GNU_VERNEED"
 	case SHT_GNU_VERSYM:
 		return "SHT_GNU_VERSYM"
+	case SHT_ANDROID_RELA:
+		return "SHT_ANDROID_RELA"
+	case SHT_ANDROID_REL:
+		return "SHT_ANDROID_REL"
+	case SHT_RELR:
+		return "SHT_RELR"
 	default:
 		return fmt.Sprintf("SHT_UNKNOWN(0x%x)", uint32(t))
 	}
@@ -378,6 +395,22 @@ func (t DT_Tag) Text() string {
 		return "DT_PREINIT_ARRAY"
 	case DT_PREINIT_ARRAYSZ:
 		return "DT_PREINIT_ARRAYSZ"
+	case DT_ANDROID_REL:
+		return "DT_ANDROID_REL"
+	case DT_ANDROID_RELSZ:
+		return "DT_ANDROID_RELSZ"
+	case DT_ANDROID_RELA:
+		return "DT_ANDROID_RELA"
+	case DT_ANDROID_RELASZ:
+		return "DT_ANDROID_RELASZ"
+	case DT_RELR:
+		return "DT_RELR"
+	case DT_RELRSZ:
+		return "DT_RELRSZ"
+	case DT_RELRENT:
+		return "DT_RELRENT"
+	case DT_RELRCOUNT:
+		return "DT_RELRCOUNT"
 	default:
 		return fmt.Sprintf("DT_UNKNOWN(0x%x)", t)
 	}
@@ -565,8 +598,11 @@ func AlignUp(value, align uint64) uint64 {
 	return (value + align - 1) & ^(align - 1)
 }
 
-func PageStart(addr uint64) uint64 {
-	mask := ^(0x1000 - 1)
+func PageStart(addr uint64, align uint64) uint64 {
+	if align == 0 {
+		align = 0x1000
+	}
+	mask := ^(align - 1)
 	return addr & uint64(mask)
 }
 

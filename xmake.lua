@@ -42,6 +42,16 @@ task("test")
             print(formatted_msg)
         end
 
+        local function log_fail(msg, ...)
+            local args = { ... }
+            local formatted_msg = string.format("\27[1;38;5;204m[x]\27[0m %s", msg)
+            for i = 1, #args, 2 do
+                formatted_msg = formatted_msg
+                    .. string.format(" \27[38;5;243m%s=\27[0m\27[38;5;147m%s\27[0m", args[i], args[i + 1])
+            end
+            print(formatted_msg)
+        end
+
         local function log_success(msg)
             print(string.format("\27[1;38;5;86m[+]\27[0m %s", msg))
         end
@@ -51,31 +61,91 @@ task("test")
 
         local gosofix = path.join("dist", "gosofix")
         local libgosofix = path.join("dist", "libgosofix.so")
-        local test_dl = path.join("dist", "test_dl")
-        local sample_so = "tests/libjiagu_64.so_dump_0x7104417000.so"
 
-        print("\n\27[1m=== Phase 1: Structural Verification ===\27[0m")
+        -- Phase 1: Binary verification
+        print("\n\27[1m=== Phase 1: Binary Verification ===\27[0m")
         log_info("verify:file", "path", gosofix)
         os.execv("file", { gosofix })
 
         log_info("verify:symbols", "target", "libgosofix.so")
-        local libgosofix_path = path.join("dist", "libgosofix.so")
-        local out = os.iorun("nm -D " .. libgosofix_path)
+        local out = os.iorun("nm -D " .. libgosofix)
         if out:find("FixElf") then
             log_success("symbol found: FixElf")
         else
-            error("FixElf not found in " .. libgosofix_path)
+            error("FixElf not found in " .. libgosofix)
         end
 
-        print("\n\27[1m=== Phase 2: Functional Testing ===\27[0m")
-        log_info("test:exec", "cmd", gosofix, "arg", sample_so)
-        os.execv(gosofix, { sample_so })
+        -- Phase 2: Multi-sample regression
+        -- Selected for diversity in size, relocation types, and structure
+        print("\n\27[1m=== Phase 2: Sample Regression ===\27[0m")
+        local samples = {
+            { file = "tests/libjiagu.so_dump_0x759b2b2000.so",            tag = "jiagu-3MB-rela+jmprel" },
+            { file = "tests/libdexprotector.so_dump_0x6ddc6d8000.so",      tag = "dexprotect-412K-rela+hash" },
+            { file = "tests/saitcza.so_dump_0x76c8436000.so",              tag = "obfuscated-2.3MB" },
+            { file = "tests/libstubiest.so_dump_0x7572b00000.so",          tag = "minimal-252K" },
+            { file = "tests/libSt9w.so_dump_0x7366c6e000.so",             tag = "corrupt-shdrs-1.4MB" },
+            { file = "tests/libriskdetector.so_dump_0x6f3d8f4000.so",      tag = "riskdetector-569K" },
+            { file = "tests/libhunter.so_dump_0x6bfda14000.so",            tag = "hunter-3.8MB" },
+            { file = "tests/libuseard.so_dump_0x71fcfa8000.so",            tag = "useard-287K" },
+        }
 
-        log_info("test:dlopen", "cmd", test_dl, "lib", libgosofix_path)
-        os.execv(test_dl, { libgosofix_path, sample_so })
+        local passed, failed = 0, 0
+        for _, s in ipairs(samples) do
+            log_info("test:fix", "sample", s.tag)
+            local sample_ok = true
 
+            try {
+                function()
+                    os.execv(gosofix, { s.file })
+                end,
+                catch {
+                    function(e)
+                        log_fail("test:fix FAILED", "sample", s.tag, "err", tostring(e))
+                        failed = failed + 1
+                        sample_ok = false
+                    end
+                }
+            }
+
+            if sample_ok then
+                local outpath = s.file:gsub("(%.[^%.]+)$", "_fix%1")
+                if not os.isfile(outpath) then
+                    outpath = s.file .. "_fix"
+                end
+
+                if os.isfile(outpath) then
+                    try {
+                        function()
+                            os.execv("readelf", { "-h", outpath })
+                            passed = passed + 1
+                        end,
+                        catch {
+                            function(e)
+                                log_fail("test:readelf FAILED", "sample", s.tag)
+                                failed = failed + 1
+                            end
+                        }
+                    }
+                else
+                    log_fail("test:output missing", "sample", s.tag)
+                    failed = failed + 1
+                end
+            end
+        end
+
+        -- Phase 3: dlopen test
+        print("\n\27[1m=== Phase 3: Library Interface ===\27[0m")
+        local test_dl = path.join("dist", "test_dl")
+        log_info("test:dlopen", "lib", libgosofix)
+        os.execv(test_dl, { libgosofix, samples[1].file })
+
+        -- Summary
         print("")
-        log_success("All tests and verification passed!")
+        if failed == 0 then
+            log_success(string.format("All tests passed! (%d/%d samples)", passed, #samples))
+        else
+            raise(string.format("%d/%d samples failed", failed, #samples))
+        end
     end)
     set_menu({
         usage = "xmake test",
