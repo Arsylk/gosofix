@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/charmbracelet/log"
 	"github.com/ianlancetaylor/demangle"
 )
 
@@ -26,11 +27,11 @@ type resolvedSymbol struct {
 }
 
 // CheckFixedElf opens the output ELF and runs post-fix sanity checks.
-// Logs diagnostics using the project's styled logger. Returns issues found.
-func CheckFixedElf(path string, baseAddr uint64, totalSize uint64) []string {
+// Logs diagnostics using the supplied logger. Returns issues found.
+func CheckFixedElf(lg *log.Logger, path string, baseAddr uint64, totalSize uint64) []string {
 	file, err := os.Open(path)
 	if err != nil {
-		logger.Error("check:open", "path", path, "err", err)
+		lg.Error("check:open", "path", path, "err", err)
 		return []string{fmt.Sprintf("failed to open: %v", err)}
 	}
 	defer file.Close()
@@ -38,7 +39,7 @@ func CheckFixedElf(path string, baseAddr uint64, totalSize uint64) []string {
 	var issues []string
 
 	// 1. ELF header sanity
-	meta, ehdrIssues := readElfMetadata(file)
+	meta, ehdrIssues := readElfMetadata(lg, file)
 	issues = append(issues, ehdrIssues...)
 	if len(ehdrIssues) > 0 && meta == nil {
 		return issues // Can't proceed without basic headers
@@ -50,21 +51,21 @@ func CheckFixedElf(path string, baseAddr uint64, totalSize uint64) []string {
 
 	// 3. Residual absolute addresses in data segments
 	if baseAddr != 0 {
-		residuals := scanResidualAddresses(file, meta, baseAddr, totalSize)
+		residuals := scanResidualAddresses(lg, file, meta, baseAddr, totalSize)
 		issues = append(issues, residuals...)
 	}
 
 	if len(issues) == 0 {
-		logger.Info("check:pass", "path", path)
+		lg.Info("check:pass", "path", path)
 	} else {
-		logger.Warn("check:issues", "path", path, "count", len(issues))
+		lg.Warn("check:issues", "path", path, "count", len(issues))
 	}
 
 	return issues
 }
 
 // readElfMetadata reads Ehdr, Phdrs, Shdrs, and Symbols for resolution.
-func readElfMetadata(file *os.File) (*elfMetadata, []string) {
+func readElfMetadata(lg *log.Logger, file *os.File) (*elfMetadata, []string) {
 	var issues []string
 	meta := &elfMetadata{}
 
@@ -127,7 +128,7 @@ func readElfMetadata(file *os.File) (*elfMetadata, []string) {
 	}
 
 	if len(issues) == 0 {
-		logger.Info("check:metadata", "phdrs", len(meta.phdrs), "shdrs", len(meta.shdrs), "symbols", len(meta.symbols))
+		lg.Info("check:metadata", "phdrs", len(meta.phdrs), "shdrs", len(meta.shdrs), "symbols", len(meta.symbols))
 	}
 
 	return meta, issues
@@ -194,8 +195,8 @@ func checkProgramHeadersConsistency(phdrs []Elf64_Phdr) []string {
 	return issues
 }
 
-// Dummy helpers if unsafe/reflect is too much or not allowed, but usually it's fine in project code.
-// Actually let's use a safer way if possible.
+// readString returns the null-terminated string starting at `offset` in `data`,
+// or "" if the offset is out of range.
 func readString(data []byte, offset uint32) string {
 	if offset >= uint32(len(data)) {
 		return ""
@@ -211,7 +212,7 @@ func readString(data []byte, offset uint32) string {
 // values that fall within [baseAddr, baseAddr+totalSize]. For each hit,
 // checks if (val - baseAddr) resolves to a legitimate offset within any
 // PT_LOAD segment, which strongly indicates a missed normalization.
-func scanResidualAddresses(file *os.File, meta *elfMetadata, baseAddr uint64, totalSize uint64) []string {
+func scanResidualAddresses(lg *log.Logger, file *os.File, meta *elfMetadata, baseAddr uint64, totalSize uint64) []string {
 	var issues []string
 	upperBound := baseAddr + totalSize
 	var totalScanned, totalResiduals, totalLegitimate int
@@ -246,7 +247,7 @@ func scanResidualAddresses(file *os.File, meta *elfMetadata, baseAddr uint64, to
 
 			totalLegitimate++
 			if totalLegitimate <= 5 {
-				logger.Warn("check:residual",
+				lg.Warn("check:residual",
 					"vaddr", fmt.Sprintf("0x%x", vaddr),
 					"val", fmt.Sprintf("0x%x", val),
 					"rebased", fmt.Sprintf("0x%x", rebased),
@@ -262,9 +263,9 @@ func scanResidualAddresses(file *os.File, meta *elfMetadata, baseAddr uint64, to
 			"residual_addrs: %d values look like un-normalized pointers (%d total candidates, %d pointers scanned)",
 			totalLegitimate, totalResiduals, totalScanned,
 		))
-		logger.Warn("check:residuals", "legitimate", totalLegitimate, "candidates", totalResiduals, "scanned", totalScanned)
+		lg.Warn("check:residuals", "legitimate", totalLegitimate, "candidates", totalResiduals, "scanned", totalScanned)
 	} else {
-		logger.Info("check:residuals", "legitimate", 0, "candidates", totalResiduals, "scanned", totalScanned)
+		lg.Info("check:residuals", "legitimate", 0, "candidates", totalResiduals, "scanned", totalScanned)
 	}
 
 	return issues

@@ -96,8 +96,18 @@ const (
 	SHF_EXECINSTR = 0x4
 	SHF_INFO_LINK = 0x40
 
-	ARM64_PLT0_SIZE      = 32
-	ARM64_PLT_ENTRY_SIZE = 16
+	// On-disk sizes of the ELF64 structures we read/write.
+	sizeofEhdr    = 64
+	sizeofPhdr    = 56
+	sizeofShdr    = 64
+	sizeofDyn     = 16
+	sizeofSym     = 24
+	sizeofRel     = 16
+	sizeofRela    = 24
+	sizeofVerneed = 16 // GNU version-need entry
+	sizeofVernaux = 16 // GNU version-need auxiliary entry
+	sizeofHashHdr = 8  // Nbucket + Nchain
+	sizeofGNUHash = 16 // Nbuckets + Symndx + Maskwords + Shift2
 )
 
 type PT_Type uint32
@@ -145,32 +155,29 @@ func (f PF_Flags) Text() string {
 	return s
 }
 
-func (sym Elf64_Sym) IsEmptySymbol() bool {
-	return sym.St_Name == 0 && sym.St_Value == 0 && sym.St_Size == 0
-}
-
 type SHT_Type uint32
 
 const (
-	SHT_NULL        SHT_Type = 0
-	SHT_PROGBITS    SHT_Type = 1
-	SHT_SYMTAB      SHT_Type = 2
-	SHT_STRTAB      SHT_Type = 3
-	SHT_RELA        SHT_Type = 4
-	SHT_HASH        SHT_Type = 5
-	SHT_DYNAMIC     SHT_Type = 6
-	SHT_NOTE        SHT_Type = 7
-	SHT_NOBITS      SHT_Type = 8
-	SHT_REL         SHT_Type = 9
-	SHT_DYNSYM      SHT_Type = 11
-	SHT_INIT_ARRAY  SHT_Type = 14
-	SHT_FINI_ARRAY  SHT_Type = 15
-	SHT_GNU_HASH    SHT_Type = 0x6ffffff6
-	SHT_GNU_VERNEED SHT_Type = 0x6ffffffe
-	SHT_GNU_VERSYM  SHT_Type = 0x6fffffff
-	SHT_ANDROID_RELA SHT_Type = 0x60000001
-	SHT_ANDROID_REL  SHT_Type = 0x60000002
-	SHT_RELR         SHT_Type = 0x6fffff00
+	SHT_NULL          SHT_Type = 0
+	SHT_PROGBITS      SHT_Type = 1
+	SHT_SYMTAB        SHT_Type = 2
+	SHT_STRTAB        SHT_Type = 3
+	SHT_RELA          SHT_Type = 4
+	SHT_HASH          SHT_Type = 5
+	SHT_DYNAMIC       SHT_Type = 6
+	SHT_NOTE          SHT_Type = 7
+	SHT_NOBITS        SHT_Type = 8
+	SHT_REL           SHT_Type = 9
+	SHT_DYNSYM        SHT_Type = 11
+	SHT_INIT_ARRAY    SHT_Type = 14
+	SHT_FINI_ARRAY    SHT_Type = 15
+	SHT_PREINIT_ARRAY SHT_Type = 16
+	SHT_GNU_HASH      SHT_Type = 0x6ffffff6
+	SHT_GNU_VERNEED   SHT_Type = 0x6ffffffe
+	SHT_GNU_VERSYM    SHT_Type = 0x6fffffff
+	SHT_ANDROID_RELA  SHT_Type = 0x60000001
+	SHT_ANDROID_REL   SHT_Type = 0x60000002
+	SHT_RELR          SHT_Type = 19 // generic ABI; some toolchains also accept 0x6fffff00
 )
 
 type DT_Tag uint64
@@ -191,7 +198,7 @@ const (
 	DT_INIT            DT_Tag = 12
 	DT_FINI            DT_Tag = 13
 	DT_SONAME          DT_Tag = 14
-	DT_RPATH           DT_Tag = 15
+	DT_RPATH           DT_Tag = 15 // older spelling of DT_RUNPATH; handled equivalently
 	DT_SYMBOLIC        DT_Tag = 16
 	DT_REL             DT_Tag = 17
 	DT_RELSZ           DT_Tag = 18
@@ -211,51 +218,27 @@ const (
 	DT_RELACOUNT       DT_Tag = 0x6ffffff9
 	DT_RELCOUNT        DT_Tag = 0x6ffffffa
 	DT_FLAGS_1         DT_Tag = 0x6ffffffb
-	DT_VERNEED        DT_Tag = 0x6ffffffe
-	DT_VERNEEDNUM     DT_Tag = 0x6fffffff
-	DT_ANDROID_REL    DT_Tag = 0x6000000f
-	DT_ANDROID_RELSZ  DT_Tag = 0x60000010
-	DT_ANDROID_RELA   DT_Tag = 0x60000011
-	DT_ANDROID_RELASZ DT_Tag = 0x60000012
-	DT_RELR           DT_Tag = 0x6fffff00
-	DT_RELRSZ         DT_Tag = 0x6fffff01
-	DT_RELRENT        DT_Tag = 0x6fffff03
-	DT_RELRCOUNT      DT_Tag = 0x6fffff05
+	DT_VERNEED         DT_Tag = 0x6ffffffe
+	DT_VERNEEDNUM      DT_Tag = 0x6fffffff
+	DT_ANDROID_REL     DT_Tag = 0x6000000f
+	DT_ANDROID_RELSZ   DT_Tag = 0x60000010
+	DT_ANDROID_RELA    DT_Tag = 0x60000011
+	DT_ANDROID_RELASZ  DT_Tag = 0x60000012
+	DT_RELR            DT_Tag = 0x6fffff00
+	DT_RELRSZ          DT_Tag = 0x6fffff01
+	DT_RELRENT         DT_Tag = 0x6fffff03
+	DT_RELRCOUNT       DT_Tag = 0x6fffff05
 )
 
-// Elf64_Verneed represents GNU symbol version requirements
+// Elf64_Verneed represents GNU symbol version requirements. We walk the chain
+// in calculateVerneedSize but don't parse the Vernaux entries — only Verneed
+// is needed to compute the section size.
 type Elf64_Verneed struct {
 	Version uint16
 	Cnt     uint16
 	File    uint32
 	Aux     uint32
 	Next    uint32
-}
-
-// Elf64_Vernaux represents auxiliary information for version requirements
-type Elf64_Vernaux struct {
-	Hash  uint32
-	Flags uint16
-	Other uint16
-	Name  uint32
-	Next  uint32
-}
-
-// Elf64_Verdef represents GNU symbol version definitions
-type Elf64_Verdef struct {
-	Version uint16
-	Flags   uint16
-	Nd      uint16
-	Cnt     uint16
-	Hash    uint32
-	Aux     uint32
-	Next    uint32
-}
-
-// Elf64_Verdaux represents auxiliary information for version definitions
-type Elf64_Verdaux struct {
-	Name uint32
-	Next uint32
 }
 
 func (p PT_Type) Text() string {
@@ -312,6 +295,8 @@ func (t SHT_Type) Text() string {
 		return "SHT_INIT_ARRAY"
 	case SHT_FINI_ARRAY:
 		return "SHT_FINI_ARRAY"
+	case SHT_PREINIT_ARRAY:
+		return "SHT_PREINIT_ARRAY"
 	case SHT_GNU_HASH:
 		return "SHT_GNU_HASH"
 	case SHT_GNU_VERNEED:
@@ -361,6 +346,10 @@ func (t DT_Tag) Text() string {
 		return "DT_FINI"
 	case DT_SONAME:
 		return "DT_SONAME"
+	case DT_RPATH:
+		return "DT_RPATH"
+	case DT_RUNPATH:
+		return "DT_RUNPATH"
 	case DT_PLTREL:
 		return "DT_PLTREL"
 	case DT_JMPREL:
@@ -423,13 +412,16 @@ const (
 	R_AARCH64_ABS64  RelocationType = 0x101 // 257 (Direct 64-bit reference)
 	R_AARCH64_PREL64 RelocationType = 0x104 // 260 (PC-relative 64-bit reference)
 
-	// Used for dynamic linker fixups
-	R_AARCH64_COPY       RelocationType = 0x108 // 264
-	R_AARCH64_GLOB_DAT   RelocationType = 0x401 // 1025 (1 + 1024)
-	R_AARCH64_JUMP_SLOT  RelocationType = 0x402 // 1026 (2 + 1024)
-	R_AARCH64_RELATIVE   RelocationType = 0x403 // 1027 (3 + 1024)
+	// Used for dynamic linker fixups (ARM IHI 0056F §4.6.6)
+	R_AARCH64_COPY       RelocationType = 0x400 // 1024
+	R_AARCH64_GLOB_DAT   RelocationType = 0x401 // 1025
+	R_AARCH64_JUMP_SLOT  RelocationType = 0x402 // 1026
+	R_AARCH64_RELATIVE   RelocationType = 0x403 // 1027
 	R_AARCH64_TLS_DTPMOD RelocationType = 0x404 // 1028
 	R_AARCH64_TLS_DTPREL RelocationType = 0x405 // 1029
+	R_AARCH64_TLS_TPREL  RelocationType = 0x406 // 1030
+	R_AARCH64_TLSDESC    RelocationType = 0x407 // 1031
+	R_AARCH64_IRELATIVE  RelocationType = 0x408 // 1032
 
 	// Other commonly used code-related relocations
 	R_AARCH64_ADR_PREL21      RelocationType = 0x113 // 275
@@ -466,6 +458,12 @@ func (r RelocationType) Text() string {
 		return "R_AARCH64_TLS_DTPMOD"
 	case R_AARCH64_TLS_DTPREL:
 		return "R_AARCH64_TLS_DTPREL"
+	case R_AARCH64_TLS_TPREL:
+		return "R_AARCH64_TLS_TPREL"
+	case R_AARCH64_TLSDESC:
+		return "R_AARCH64_TLSDESC"
+	case R_AARCH64_IRELATIVE:
+		return "R_AARCH64_IRELATIVE"
 	default:
 		// Default case for unknown relocation types
 		return fmt.Sprintf("UNKNOWN_RELOC_TYPE(%d)", r)
@@ -566,40 +564,12 @@ type GNUHashHeader struct {
 	Shift2    uint32
 }
 
-// AddrRange represents a range of virtual addresses occupied by a section
-type AddrRange struct {
-	Start uint64
-	End   uint64
-	Name  string
-}
-
-// ComputedSection holds metadata for sections discovered during analysis
-type ComputedSection struct {
-	Name      string
-	Type      SHT_Type
-	Flags     uint64
-	Addr      uint64
-	Size      uint64
-	Link      uint32
-	Info      uint32
-	Addralign uint64
-	Entsize   uint64
-}
-
 // AlignUp rounds up 'value' to the next multiple of 'align'
 func AlignUp(value, align uint64) uint64 {
 	if align == 0 {
 		return value
 	}
 	return (value + align - 1) & ^(align - 1)
-}
-
-func PageStart(addr uint64, align uint64) uint64 {
-	if align == 0 {
-		align = 0x1000
-	}
-	mask := ^(align - 1)
-	return addr & uint64(mask)
 }
 
 // DemangleSymbol attempts to demangle a C++ mangled symbol name.
