@@ -1,4 +1,4 @@
-tests/*.so
+samples/*.so
 dist/
 build/
 .xmake
