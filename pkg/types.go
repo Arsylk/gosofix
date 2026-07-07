@@ -8,26 +8,26 @@ import (
 
 // Elf64_Ehdr represents the main ELF header structure (e_ident + rest of header).
 type Elf64_Ehdr struct {
-	Magic      [4]byte // 0x00-0x03: Magic number
-	Class      uint8   // 0x04: 32-bit or 64-bit
-	Data       uint8   // 0x05: Little or big endian
-	Version    uint8   // 0x06: ELF version
-	OSABI      uint8   // 0x07: OS/ABI identification
-	ABIVersion uint8   // 0x08: ABI version
-	Padding    [7]byte // 0x09-0x0F: Unused
-	Type       uint16  // 0x10-0x11: object file type
-	Machine    uint16  // 0x12-0x13: architecture
-	Version2   uint32  // 0x14-0x17: ELF version (again)
-	Entry      uint64  // 0x18-0x1F: entry point virtual address
-	PhdrOffset uint64  // 0x20-0x27: program header table file offset
-	ShdrOffset uint64  // 0x28-0x2F: section header table file offset
-	Flags      uint32  // 0x30-0x33: processor specific flags
-	Ehsize     uint16  // 0x34-0x35: ELF header size
-	Phentsize  uint16  // 0x36-0x37: size of an entry in the program header table
-	Phnum      uint16  // 0x38-0x39: number of entries in the program header table
-	Shentsize  uint16  // 0x3A-0x3B: size of an entry in the section header table
-	Shnum      uint16  // 0x3C-0x3D: number of entries in the section header table
-	Shstrndx   uint16  // 0x3E-0x3F: section header string table index
+	Magic        [4]byte // 0x00-0x03: Magic number
+	Class        uint8   // 0x04: 32-bit or 64-bit
+	Data         uint8   // 0x05: Little or big endian
+	IdentVersion uint8   // 0x06: e_ident[EI_VERSION]
+	OSABI        uint8   // 0x07: OS/ABI identification
+	ABIVersion   uint8   // 0x08: ABI version
+	Padding      [7]byte // 0x09-0x0F: Unused
+	Type         uint16  // 0x10-0x11: object file type
+	Machine      uint16  // 0x12-0x13: architecture
+	Version      uint32  // 0x14-0x17: e_version (object file version)
+	Entry        uint64  // 0x18-0x1F: entry point virtual address
+	PhdrOffset   uint64  // 0x20-0x27: program header table file offset
+	ShdrOffset   uint64  // 0x28-0x2F: section header table file offset
+	Flags        uint32  // 0x30-0x33: processor specific flags
+	Ehsize       uint16  // 0x34-0x35: ELF header size
+	Phentsize    uint16  // 0x36-0x37: size of an entry in the program header table
+	Phnum        uint16  // 0x38-0x39: number of entries in the program header table
+	Shentsize    uint16  // 0x3A-0x3B: size of an entry in the section header table
+	Shnum        uint16  // 0x3C-0x3D: number of entries in the section header table
+	Shstrndx     uint16  // 0x3E-0x3F: section header string table index
 }
 
 // Elf64_Phdr represents a 64-bit program header entry (Elf64_Phdr).
@@ -77,16 +77,17 @@ type Elf64_Rel struct {
 
 // Elf64_Sym represents a 64-bit ELF symbol table entry
 type Elf64_Sym struct {
-	St_Name  uint32 // Symbol name (index into string table)
-	St_Info  uint8  // Symbol type and binding attributes
-	St_Other uint8  // Visibility and other attributes
-	St_Shndx uint16 // Section index where the symbol is defined
-	St_Value uint64 // Value of the symbol (address or offset)
-	St_Size  uint64 // Size of the symbol
+	Name  uint32 // Symbol name (index into string table)
+	Info  uint8  // Symbol type and binding attributes
+	Other uint8  // Visibility and other attributes
+	Shndx uint16 // Section index where the symbol is defined
+	Value uint64 // Value of the symbol (address or offset)
+	Size  uint64 // Size of the symbol
 }
 
 const (
-	ELFCLASS64 = 2
+	ELFCLASS64  = 2
+	ELFDATA2LSB = 1
 
 	ET_DYN     = 3
 	EM_AARCH64 = 183
@@ -108,6 +109,14 @@ const (
 	sizeofVernaux = 16 // GNU version-need auxiliary entry
 	sizeofHashHdr = 8  // Nbucket + Nchain
 	sizeofGNUHash = 16 // Nbuckets + Symndx + Maskwords + Shift2
+	sizeofPtr     = 8  // AArch64 pointer / GOT slot / RELR entry / array-entry width
+
+	// Byte offsets of the ELF64 header fields patched in place after rebuild.
+	ehOffEntry     = 24 // e_entry
+	ehOffShoff     = 40 // e_shoff
+	ehOffShentsize = 58 // e_shentsize
+	ehOffShnum     = 60 // e_shnum
+	ehOffShstrndx  = 62 // e_shstrndx
 )
 
 type PT_Type uint32
@@ -132,7 +141,7 @@ const (
 	PF_R PF_Flags = 4 // Read
 )
 
-func (f PF_Flags) Text() string {
+func (f PF_Flags) String() string {
 	var s string
 	if (f & PF_R) != 0 {
 		s += "PF_R"
@@ -175,9 +184,10 @@ const (
 	SHT_GNU_HASH      SHT_Type = 0x6ffffff6
 	SHT_GNU_VERNEED   SHT_Type = 0x6ffffffe
 	SHT_GNU_VERSYM    SHT_Type = 0x6fffffff
-	SHT_ANDROID_RELA  SHT_Type = 0x60000001
-	SHT_ANDROID_REL   SHT_Type = 0x60000002
-	SHT_RELR          SHT_Type = 19 // generic ABI; some toolchains also accept 0x6fffff00
+	SHT_ANDROID_REL   SHT_Type = 0x60000001
+	SHT_ANDROID_RELA  SHT_Type = 0x60000002
+	SHT_RELR          SHT_Type = 19         // generic ABI RELR section
+	SHT_ANDROID_RELR  SHT_Type = 0x6fffff00 // legacy Android experimental RELR section
 )
 
 type DT_Tag uint64
@@ -224,10 +234,19 @@ const (
 	DT_ANDROID_RELSZ   DT_Tag = 0x60000010
 	DT_ANDROID_RELA    DT_Tag = 0x60000011
 	DT_ANDROID_RELASZ  DT_Tag = 0x60000012
-	DT_RELR            DT_Tag = 0x6fffff00
-	DT_RELRSZ          DT_Tag = 0x6fffff01
-	DT_RELRENT         DT_Tag = 0x6fffff03
-	DT_RELRCOUNT       DT_Tag = 0x6fffff05
+
+	// Generic ABI RELR dynamic tags. These are present in current Android NDK
+	// headers and supported by Android API >= 30.
+	DT_RELRSZ  DT_Tag = 35
+	DT_RELR    DT_Tag = 36
+	DT_RELRENT DT_Tag = 37
+
+	// Legacy Android experimental RELR dynamic tags. Note that 0x6fffff00 is
+	// SHT_ANDROID_RELR (a section type), not DT_ANDROID_RELR.
+	DT_ANDROID_RELR      DT_Tag = 0x6fffe000
+	DT_ANDROID_RELRSZ    DT_Tag = 0x6fffe001
+	DT_ANDROID_RELRENT   DT_Tag = 0x6fffe003
+	DT_ANDROID_RELRCOUNT DT_Tag = 0x6fffe005
 )
 
 // Elf64_Verneed represents GNU symbol version requirements. We walk the chain
@@ -241,7 +260,7 @@ type Elf64_Verneed struct {
 	Next    uint32
 }
 
-func (p PT_Type) Text() string {
+func (p PT_Type) String() string {
 	switch p {
 	case PT_LOAD:
 		return "PT_LOAD"
@@ -263,11 +282,11 @@ func (p PT_Type) Text() string {
 		return "PT_GNU_RELRO"
 	default:
 		// Handle unknown or vendor-specific types
-		return fmt.Sprintf("UNKNOWN_PT_TYPE(0x%x)", p)
+		return fmt.Sprintf("UNKNOWN_PT_TYPE(0x%x)", uint32(p))
 	}
 }
 
-func (t SHT_Type) Text() string {
+func (t SHT_Type) String() string {
 	switch t {
 	case SHT_NULL:
 		return "SHT_NULL"
@@ -309,12 +328,14 @@ func (t SHT_Type) Text() string {
 		return "SHT_ANDROID_REL"
 	case SHT_RELR:
 		return "SHT_RELR"
+	case SHT_ANDROID_RELR:
+		return "SHT_ANDROID_RELR"
 	default:
 		return fmt.Sprintf("SHT_UNKNOWN(0x%x)", uint32(t))
 	}
 }
 
-func (t DT_Tag) Text() string {
+func (t DT_Tag) String() string {
 	switch t {
 	case DT_NULL:
 		return "DT_NULL"
@@ -398,10 +419,16 @@ func (t DT_Tag) Text() string {
 		return "DT_RELRSZ"
 	case DT_RELRENT:
 		return "DT_RELRENT"
-	case DT_RELRCOUNT:
-		return "DT_RELRCOUNT"
+	case DT_ANDROID_RELR:
+		return "DT_ANDROID_RELR"
+	case DT_ANDROID_RELRSZ:
+		return "DT_ANDROID_RELRSZ"
+	case DT_ANDROID_RELRENT:
+		return "DT_ANDROID_RELRENT"
+	case DT_ANDROID_RELRCOUNT:
+		return "DT_ANDROID_RELRCOUNT"
 	default:
-		return fmt.Sprintf("DT_UNKNOWN(0x%x)", t)
+		return fmt.Sprintf("DT_UNKNOWN(0x%x)", uint64(t))
 	}
 }
 
@@ -424,13 +451,13 @@ const (
 	R_AARCH64_IRELATIVE  RelocationType = 0x408 // 1032
 
 	// Other commonly used code-related relocations
-	R_AARCH64_ADR_PREL21      RelocationType = 0x113 // 275
-	R_AARCH64_ADD_ABS_LO12_NC RelocationType = 0x114 // 276
-	R_AARCH64_CALL26          RelocationType = 0x11B // 283
-	R_AARCH64_JUMP26          RelocationType = 0x11C // 284
+	R_AARCH64_ADR_PREL_PG_HI21 RelocationType = 0x113 // 275
+	R_AARCH64_ADD_ABS_LO12_NC  RelocationType = 0x114 // 276
+	R_AARCH64_CALL26           RelocationType = 0x11B // 283
+	R_AARCH64_JUMP26           RelocationType = 0x11C // 284
 )
 
-func (r RelocationType) Text() string {
+func (r RelocationType) String() string {
 	switch r {
 	case R_AARCH64_NONE:
 		return "R_AARCH64_NONE"
@@ -440,8 +467,8 @@ func (r RelocationType) Text() string {
 		return "R_AARCH64_PREL64"
 	case R_AARCH64_COPY:
 		return "R_AARCH64_COPY"
-	case R_AARCH64_ADR_PREL21:
-		return "R_AARCH64_ADR_PREL21"
+	case R_AARCH64_ADR_PREL_PG_HI21:
+		return "R_AARCH64_ADR_PREL_PG_HI21"
 	case R_AARCH64_ADD_ABS_LO12_NC:
 		return "R_AARCH64_ADD_ABS_LO12_NC"
 	case R_AARCH64_CALL26:
@@ -478,7 +505,7 @@ const (
 	STB_WEAK   SymbolBinding = 2
 )
 
-func (b SymbolBinding) Text() string {
+func (b SymbolBinding) String() string {
 	switch b {
 	case STB_LOCAL:
 		return "STB_LOCAL"
@@ -504,7 +531,7 @@ const (
 	STT_TLS     SymbolType = 6
 )
 
-func (t SymbolType) Text() string {
+func (t SymbolType) String() string {
 	switch t {
 	case STT_NOTYPE:
 		return "STT_NOTYPE"
@@ -527,11 +554,11 @@ func (t SymbolType) Text() string {
 
 // Helper functions for symbol info
 func (s Elf64_Sym) StBind() SymbolBinding {
-	return SymbolBinding(s.St_Info >> 4)
+	return SymbolBinding(s.Info >> 4)
 }
 
 func (s Elf64_Sym) StType() SymbolType {
-	return SymbolType(s.St_Info & 0xf)
+	return SymbolType(s.Info & 0xf)
 }
 
 func (r Elf64_Rel) Type() RelocationType {

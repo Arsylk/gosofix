@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"strconv"
 
-	pkg "github.com/Arsylk/gosofix/pkg"
+	sofixer "github.com/Arsylk/gosofix/pkg"
 )
 
 // FixElf is the quiet-mode shared-library entry. The returned C string must be
@@ -56,7 +56,7 @@ func fixElf(inputPath string, memAddr uint64, outputPath string, verbosity int) 
 		outputPath = autogenerateOutputPath(inputPath)
 	}
 
-	issues, err := pkg.FixELFHeaders(inputPath, memAddr, outputPath, verbosity)
+	issues, err := sofixer.FixELFHeaders(inputPath, memAddr, outputPath, verbosity)
 	if err != nil {
 		return "", err
 	}

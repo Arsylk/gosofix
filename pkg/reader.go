@@ -30,14 +30,20 @@ type ElfReader struct {
 	symtabVaddr      uint64
 	relVaddr         uint64
 	relSize          uint64
+	relEntrySize     uint64
 	relaVaddr        uint64
 	relaSize         uint64
+	relaEntrySize    uint64
 	relrVaddr        uint64
 	relrSize         uint64
+	relrEntrySize    uint64
+	relrSectionType  SHT_Type
 	androidRelVaddr  uint64
 	androidRelSize   uint64
+	androidRelDirty  bool
 	androidRelaVaddr uint64
 	androidRelaSize  uint64
+	androidRelaDirty bool
 	jmprelVaddr      uint64
 	jmprelSize       uint64
 	jmprelEntrySize  uint64
@@ -138,12 +144,15 @@ func (r *ElfReader) ReadElfHeader() error {
 	if r.ElfHeader.Class != ELFCLASS64 {
 		return fmt.Errorf("unsupported ELF class: %d (expected 64-bit/2)", r.ElfHeader.Class)
 	}
+	if r.ElfHeader.Data != ELFDATA2LSB {
+		return fmt.Errorf("unsupported ELF data encoding: %d (expected little-endian/1)", r.ElfHeader.Data)
+	}
 	if r.ElfHeader.Machine != EM_AARCH64 {
 		return fmt.Errorf("unsupported architecture: %d (expected AArch64/183)", r.ElfHeader.Machine)
 	}
-	if r.ElfHeader.Version != 1 || r.ElfHeader.Version2 != 1 {
+	if r.ElfHeader.IdentVersion != 1 || r.ElfHeader.Version != 1 {
 		return fmt.Errorf("invalid ELF version: e_ident[EI_VERSION]=%d e_version=%d (expected 1)",
-			r.ElfHeader.Version, r.ElfHeader.Version2)
+			r.ElfHeader.IdentVersion, r.ElfHeader.Version)
 	}
 	if r.ElfHeader.Ehsize != sizeofEhdr {
 		return fmt.Errorf("invalid ELF header size: %d (expected %d)", r.ElfHeader.Ehsize, sizeofEhdr)
@@ -162,16 +171,16 @@ func (r *ElfReader) ReadElfHeader() error {
 func (r *ElfReader) ReadPhdrs() error {
 	phtSize := uint64(r.ElfHeader.Phnum) * uint64(r.ElfHeader.Phentsize)
 	if phtSize == 0 {
-		return fmt.Errorf("phdr read | no program headers found")
+		return fmt.Errorf("phdr read: no program headers found")
 	}
 	if r.ElfHeader.Phnum > 1024 {
-		return fmt.Errorf("phdr read | too many headers: %d (max 1024)", r.ElfHeader.Phnum)
+		return fmt.Errorf("phdr read: too many headers: %d (max 1024)", r.ElfHeader.Phnum)
 	}
 
 	r.logger.Info("phdr read", "offset", r.ElfHeader.PhdrOffset, "count", r.ElfHeader.Phnum)
 
 	var err error
-	if r.Phdrs, err = readArray[Elf64_Phdr](r.logger, r.File, r.ElfHeader.PhdrOffset, uint64(r.ElfHeader.Phnum), "PT_PHDR"); err != nil {
+	if r.Phdrs, err = readArray[Elf64_Phdr](r.File, r.ElfHeader.PhdrOffset, uint64(r.ElfHeader.Phnum), "PT_PHDR"); err != nil {
 		return err
 	}
 
@@ -207,11 +216,11 @@ func (r *ElfReader) ReadPhdrs() error {
 		if r.logger.GetLevel() == log.DebugLevel {
 			r.logger.Debug("phdr entry",
 				"index", i,
-				"type", phdr.Type.Text(),
+				"type", phdr.Type.String(),
 				"vaddr", phdr.Vaddr,
 				"file_size", phdr.Filesz,
 				"memory_size", phdr.Memsz,
-				"flags", phdr.Flags.Text(),
+				"flags", phdr.Flags.String(),
 			)
 		}
 	}
@@ -219,19 +228,64 @@ func (r *ElfReader) ReadPhdrs() error {
 	return nil
 }
 
-// vaddrToOffset maps a virtual address into a file offset using PT_LOAD ranges.
-// For inputs that don't fall in any PT_LOAD (corrupt dumps), it returns the vaddr
-// unchanged — this is the linear-dump fallback. Logged at Debug so misses are visible.
-func (r *ElfReader) vaddrToOffset(vaddr uint64) uint64 {
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD {
-			if vaddr >= phdr.Vaddr && vaddr < phdr.Vaddr+phdr.Memsz {
-				return phdr.Offset + (vaddr - phdr.Vaddr)
-			}
+// rebaseInLoad subtracts base from val when val falls inside a PT_LOAD segment's
+// runtime range [base+vaddr, base+vaddr+memsz). Returns (normalized, true) on a
+// hit and (0, false) otherwise. Shared by the reader, rebuilder, and checker so
+// the overflow/range guard lives in exactly one place.
+func rebaseInLoad(phdrs []Elf64_Phdr, base, val uint64) (uint64, bool) {
+	if base == 0 {
+		return 0, false
+	}
+	for _, phdr := range phdrs {
+		if phdr.Type != PT_LOAD || phdr.Memsz == 0 {
+			continue
 		}
+		start := base + phdr.Vaddr
+		end := start + phdr.Memsz
+		if end < start {
+			continue
+		}
+		if val >= start && val < end {
+			return val - base, true
+		}
+	}
+	return 0, false
+}
+
+// vaddrToFileOffset maps a virtual address into a file offset using PT_LOAD
+// ranges, returning (offset, true) on a hit and (0, false) on a miss.
+func (r *ElfReader) vaddrToFileOffset(vaddr uint64) (uint64, bool) {
+	for _, phdr := range r.Phdrs {
+		if phdr.Type != PT_LOAD {
+			continue
+		}
+		if vaddr >= phdr.Vaddr && vaddr < phdr.Vaddr+phdr.Memsz {
+			return phdr.Offset + (vaddr - phdr.Vaddr), true
+		}
+	}
+	return 0, false
+}
+
+// vaddrToOffset is the linear-dump variant of vaddrToFileOffset: on a miss it
+// returns the vaddr unchanged (corrupt dumps are read linearly). Logged at Debug
+// so misses are visible.
+func (r *ElfReader) vaddrToOffset(vaddr uint64) uint64 {
+	if off, ok := r.vaddrToFileOffset(vaddr); ok {
+		return off
 	}
 	r.logger.Debug("vaddr fallback", "reason", "no PT_LOAD match", "vaddr", vaddr)
 	return vaddr
+}
+
+func (r *ElfReader) normalizeLoadedAddress(val uint64) (uint64, bool) {
+	return rebaseInLoad(r.Phdrs, r.BaseAddr, val)
+}
+
+func (r *ElfReader) normalizeLoadedAddressValue(val uint64) uint64 {
+	if normalized, ok := r.normalizeLoadedAddress(val); ok {
+		return normalized
+	}
+	return val
 }
 
 func (r *ElfReader) ReadDyns() error {
@@ -265,17 +319,20 @@ func (r *ElfReader) ReadDyns() error {
 	if entryCount == 0 {
 		return fmt.Errorf("dynamic section has zero entries")
 	}
+	if dynamicPhdr.Memsz%uint64(sizeofDyn) != 0 {
+		return fmt.Errorf("dynamic section size %d is not a multiple of entry size %d", dynamicPhdr.Memsz, sizeofDyn)
+	}
 
 	r.logger.Info("dyn read", "vaddr", dynamicPhdr.Vaddr, "count", entryCount)
 
-	// Store dynamic section info for rebuilder. Memory dumps are linear, so we
-	// reuse the virtual address as the file offset.
+	// Store dynamic section info for rebuilder. The address is kept as a vaddr;
+	// the read uses p_offset so normal ET_DYN files and linear dumps both work.
 	r.dynamicVaddr = dynamicPhdr.Vaddr
 	r.dynamicSize = dynamicPhdr.Memsz
 
 	// Read the dynamic section content
 	var err error
-	if r.Dyns, err = readArray[Elf64_Dyn](r.logger, r.File, r.dynamicVaddr, entryCount, "DT_DYNAMIC"); err != nil {
+	if r.Dyns, err = readArray[Elf64_Dyn](r.File, dynamicPhdr.Offset, entryCount, "DT_DYNAMIC"); err != nil {
 		return err
 	}
 
@@ -288,12 +345,16 @@ func (r *ElfReader) ReadDyns() error {
 		}
 		val := entry.Val
 
-		// Normalize addresses relative to base
+		// Normalize address-valued dynamic entries relative to the dump base.
+		// Android linear dumps can contain either original relative d_ptr values
+		// or runtime-absolute d_ptr values; this conditional handles both forms.
 		switch entry.Tag {
-		case DT_STRTAB, DT_SYMTAB, DT_REL, DT_RELA, DT_JMPREL, DT_HASH, DT_GNU_HASH, DT_INIT_ARRAY, DT_FINI_ARRAY, DT_PREINIT_ARRAY, DT_VERNEED, DT_VERSYM, DT_INIT, DT_FINI, DT_PLTGOT, DT_ANDROID_REL, DT_ANDROID_RELA, DT_RELR:
-			if val >= r.BaseAddr {
-				val -= r.BaseAddr
-			}
+		case DT_STRTAB, DT_SYMTAB, DT_REL, DT_RELA, DT_JMPREL,
+			DT_HASH, DT_GNU_HASH, DT_INIT_ARRAY, DT_FINI_ARRAY,
+			DT_PREINIT_ARRAY, DT_VERNEED, DT_VERSYM, DT_INIT, DT_FINI,
+			DT_PLTGOT, DT_ANDROID_REL, DT_ANDROID_RELA, DT_RELR,
+			DT_ANDROID_RELR:
+			val = r.normalizeLoadedAddressValue(val)
 		}
 
 		// Write back normalized value to Dyns for later serialization
@@ -313,12 +374,16 @@ func (r *ElfReader) ReadDyns() error {
 			r.relVaddr = val
 		case DT_RELSZ:
 			r.relSize = val
+		case DT_RELENT:
+			r.relEntrySize = val
 		case DT_PLTGOT:
 			r.pltGotVaddr = val
 		case DT_RELA:
 			r.relaVaddr = val
 		case DT_RELASZ:
 			r.relaSize = val
+		case DT_RELAENT:
+			r.relaEntrySize = val
 		case DT_ANDROID_RELA:
 			r.androidRelaVaddr = val
 		case DT_ANDROID_RELASZ:
@@ -329,15 +394,24 @@ func (r *ElfReader) ReadDyns() error {
 			r.androidRelSize = val
 		case DT_RELR:
 			r.relrVaddr = val
-		case DT_RELRSZ:
+			r.relrSectionType = SHT_RELR
+		case DT_ANDROID_RELR:
+			r.relrVaddr = val
+			r.relrSectionType = SHT_ANDROID_RELR
+		case DT_RELRSZ, DT_ANDROID_RELRSZ:
 			r.relrSize = val
+		case DT_RELRENT, DT_ANDROID_RELRENT:
+			r.relrEntrySize = val
 		case DT_JMPREL:
 			r.jmprelVaddr = val
 		case DT_PLTREL:
-			if val == uint64(DT_REL) {
+			switch DT_Tag(val) {
+			case DT_REL:
 				r.jmprelEntrySize = uint64(sizeofRel)
-			} else {
+			case DT_RELA:
 				r.jmprelEntrySize = uint64(sizeofRela)
+			default:
+				return fmt.Errorf("jmprel:unsupported DT_PLTREL tag=%d", val)
 			}
 		case DT_PLTRELSZ:
 			r.jmprelSize = val
@@ -363,7 +437,7 @@ func (r *ElfReader) ReadDyns() error {
 			r.versymVaddr = val
 		}
 
-		r.logger.Debug("dyn entry", "tag", entry.Tag.Text(), "value", val)
+		r.logger.Debug("dyn entry", "tag", entry.Tag.String(), "value", val)
 	}
 
 	return nil
@@ -420,11 +494,31 @@ func (r *ElfReader) ReadRelocs() error {
 	return r.readRelocationTables()
 }
 
+func fixedRelocationEntrySize(name string, got uint64, expected uint64) (uint64, error) {
+	if got == 0 {
+		return expected, nil
+	}
+	if got != expected {
+		return 0, fmt.Errorf("%s:bad_entry_size got=%d expected=%d", name, got, expected)
+	}
+	return got, nil
+}
+
+func relocationEntryCount(name string, tableSize uint64, entrySize uint64) (uint64, error) {
+	if entrySize == 0 {
+		return 0, fmt.Errorf("%s:missing_entry_size", name)
+	}
+	if tableSize%entrySize != 0 {
+		return 0, fmt.Errorf("%s:bad_size size=%d entry_size=%d", name, tableSize, entrySize)
+	}
+	return tableSize / entrySize, nil
+}
+
 // readSymbols reads the symbol table
 func (r *ElfReader) readSymbols() error {
 	var err error
 	if r.symCount, err = r.calculateSymbolCount(); err != nil {
-		return fmt.Errorf("sym:read | %w", err)
+		return fmt.Errorf("sym:read: %w", err)
 	}
 
 	if r.symCount == 0 {
@@ -434,7 +528,7 @@ func (r *ElfReader) readSymbols() error {
 
 	r.logger.Info("sym read", "vaddr", r.symtabVaddr, "count", r.symCount)
 	fileOffset := r.vaddrToOffset(r.symtabVaddr)
-	if r.Symbols, err = readArray[Elf64_Sym](r.logger, r.File, fileOffset, r.symCount, "DT_SYMTAB"); err != nil {
+	if r.Symbols, err = readArray[Elf64_Sym](r.File, fileOffset, r.symCount, "DT_SYMTAB"); err != nil {
 		return fmt.Errorf("failed to read symbols: %w", err)
 	}
 
@@ -442,115 +536,143 @@ func (r *ElfReader) readSymbols() error {
 	for i := range r.Symbols {
 		sym := &r.Symbols[i]
 		// TLS symbols have st_value relative to TLS block, not vaddr — skip normalization
-		if r.BaseAddr != 0 && sym.St_Value >= r.BaseAddr && sym.StType() != STT_TLS {
-			sym.St_Value -= r.BaseAddr
+		if sym.StType() != STT_TLS {
+			sym.Value = r.normalizeLoadedAddressValue(sym.Value)
 		}
 	}
 
 	return nil
 }
 
+func (r *ElfReader) normalizeRelOffsets(list []Elf64_Rel) {
+	for i := range list {
+		list[i].Offset = r.normalizeLoadedAddressValue(list[i].Offset)
+	}
+}
+
+func (r *ElfReader) normalizeRelaOffsets(list []Elf64_Rela) {
+	for i := range list {
+		list[i].Offset = r.normalizeLoadedAddressValue(list[i].Offset)
+	}
+}
+
 // readRelocationTables reads all relocation tables (REL, RELA, JMPREL)
 func (r *ElfReader) readRelocationTables() error {
-	var err error
-
 	if r.relVaddr != 0 {
-		relCount := r.relSize / uint64(sizeofRel)
-		fileOffset := r.vaddrToOffset(r.relVaddr)
-		r.logger.Info("rel read", "vaddr", r.relVaddr, "count", relCount)
-		if r.Rel, err = readArray[Elf64_Rel](r.logger, r.File, fileOffset, relCount, "DT_REL"); err != nil {
+		entrySize, err := fixedRelocationEntrySize("DT_REL", r.relEntrySize, uint64(sizeofRel))
+		if err != nil {
 			return err
 		}
-		// Normalize REL offsets
-		for i := range r.Rel {
-			if r.BaseAddr != 0 && r.Rel[i].Offset >= r.BaseAddr {
-				r.Rel[i].Offset -= r.BaseAddr
-			}
+		relCount, err := relocationEntryCount("DT_REL", r.relSize, entrySize)
+		if err != nil {
+			return err
 		}
+		fileOffset := r.vaddrToOffset(r.relVaddr)
+		r.logger.Info("rel read", "vaddr", r.relVaddr, "count", relCount)
+		if r.Rel, err = readArray[Elf64_Rel](r.File, fileOffset, relCount, "DT_REL"); err != nil {
+			return err
+		}
+		r.normalizeRelOffsets(r.Rel)
 	}
 
 	if r.relaVaddr != 0 {
-		relaCount := r.relaSize / uint64(sizeofRela)
-		fileOffset := r.vaddrToOffset(r.relaVaddr)
-		r.logger.Info("rela read", "vaddr", r.relaVaddr, "count", relaCount)
-		if r.Rela, err = readArray[Elf64_Rela](r.logger, r.File, fileOffset, relaCount, "DT_RELA"); err != nil {
+		entrySize, err := fixedRelocationEntrySize("DT_RELA", r.relaEntrySize, uint64(sizeofRela))
+		if err != nil {
 			return err
 		}
-		// Normalize RELA offsets
-		for i := range r.Rela {
-			if r.BaseAddr != 0 && r.Rela[i].Offset >= r.BaseAddr {
-				r.Rela[i].Offset -= r.BaseAddr
-			}
+		relaCount, err := relocationEntryCount("DT_RELA", r.relaSize, entrySize)
+		if err != nil {
+			return err
 		}
+		fileOffset := r.vaddrToOffset(r.relaVaddr)
+		r.logger.Info("rela read", "vaddr", r.relaVaddr, "count", relaCount)
+		if r.Rela, err = readArray[Elf64_Rela](r.File, fileOffset, relaCount, "DT_RELA"); err != nil {
+			return err
+		}
+		r.normalizeRelaOffsets(r.Rela)
 	}
 
 	if r.androidRelVaddr != 0 && r.androidRelSize > 0 {
 		fileOffset := r.vaddrToOffset(r.androidRelVaddr)
-		var err2 error
-		r.AndroidRel, err2 = r.decodePackedRel(fileOffset, r.androidRelSize)
-		if err2 != nil {
-			r.logger.Warn("android_rel decode", "error", err2)
-		} else {
-			r.logger.Info("android_rel read", "vaddr", r.androidRelVaddr, "decoded_count", len(r.AndroidRel))
+		r.androidRelDirty = false
+		androidRel, err := r.decodePackedRel(fileOffset, r.androidRelSize)
+		if err != nil {
+			return fmt.Errorf("android_rel decode: %w", err)
 		}
+		r.AndroidRel = androidRel
+		if r.androidRelDirty {
+			return fmt.Errorf("android_rel:dirty_offsets unsupported without packed relocation re-encode")
+		}
+		r.logger.Info("android_rel read", "vaddr", r.androidRelVaddr, "decoded_count", len(r.AndroidRel))
 	}
 
 	if r.androidRelaVaddr != 0 && r.androidRelaSize > 0 {
 		fileOffset := r.vaddrToOffset(r.androidRelaVaddr)
-		var err2 error
-		r.AndroidRela, err2 = r.decodePackedRela(fileOffset, r.androidRelaSize)
-		if err2 != nil {
-			r.logger.Warn("android_rela decode", "error", err2)
-		} else {
-			r.logger.Info("android_rela read", "vaddr", r.androidRelaVaddr, "decoded_count", len(r.AndroidRela))
+		r.androidRelaDirty = false
+		androidRela, err := r.decodePackedRela(fileOffset, r.androidRelaSize)
+		if err != nil {
+			return fmt.Errorf("android_rela decode: %w", err)
 		}
+		r.AndroidRela = androidRela
+		if r.androidRelaDirty {
+			return fmt.Errorf("android_rela:dirty_offsets unsupported without packed relocation re-encode")
+		}
+		r.logger.Info("android_rela read", "vaddr", r.androidRelaVaddr, "decoded_count", len(r.AndroidRela))
 	}
 
 	if r.relrVaddr != 0 {
-		count := r.relrSize / 8
+		entrySize, err := fixedRelocationEntrySize("DT_RELR", r.relrEntrySize, sizeofPtr)
+		if err != nil {
+			return err
+		}
+		count, err := relocationEntryCount("DT_RELR", r.relrSize, entrySize)
+		if err != nil {
+			return err
+		}
 		fileOffset := r.vaddrToOffset(r.relrVaddr)
 		r.logger.Info("relr read", "vaddr", r.relrVaddr, "count", count)
-		if r.Relr, err = readArray[uint64](r.logger, r.File, fileOffset, count, "DT_RELR"); err != nil {
+		if r.Relr, err = readArray[uint64](r.File, fileOffset, count, "DT_RELR"); err != nil {
 			return err
 		}
 	}
 
 	if r.jmprelVaddr != 0 {
 		if r.jmprelEntrySize == 0 {
-			r.jmprelEntrySize = uint64(sizeofRela)
-			r.logger.Warn("jmprel default", "detail", "dt_pltrel missing, assuming rela")
+			return fmt.Errorf("DT_JMPREL:missing_DT_PLTREL")
 		}
 		fileOffset := r.vaddrToOffset(r.jmprelVaddr)
 		switch r.jmprelEntrySize {
 		case uint64(sizeofRel):
-			jmprelCount := r.jmprelSize / uint64(sizeofRel)
+			jmprelCount, err := relocationEntryCount("DT_JMPREL", r.jmprelSize, uint64(sizeofRel))
+			if err != nil {
+				return err
+			}
 			r.logger.Info("jmprel read", "vaddr", r.jmprelVaddr, "count", jmprelCount, "type", "rel")
-			if r.JmpRel, err = readArray[Elf64_Rel](r.logger, r.File, fileOffset, jmprelCount, "DT_JMPREL"); err != nil {
+			if r.JmpRel, err = readArray[Elf64_Rel](r.File, fileOffset, jmprelCount, "DT_JMPREL"); err != nil {
 				return err
 			}
-			// Normalize JMPREL (REL) offsets
-			for i := range r.JmpRel {
-				if r.BaseAddr != 0 && r.JmpRel[i].Offset >= r.BaseAddr {
-					r.JmpRel[i].Offset -= r.BaseAddr
-				}
-			}
+			r.normalizeRelOffsets(r.JmpRel)
 		case uint64(sizeofRela):
-			jmprelCount := r.jmprelSize / uint64(sizeofRela)
-			r.logger.Info("jmprel read", "vaddr", r.jmprelVaddr, "count", jmprelCount, "type", "rela")
-			if r.JmpRela, err = readArray[Elf64_Rela](r.logger, r.File, fileOffset, jmprelCount, "DT_JMPRELA"); err != nil {
+			jmprelCount, err := relocationEntryCount("DT_JMPREL", r.jmprelSize, uint64(sizeofRela))
+			if err != nil {
 				return err
 			}
-			// Normalize JMPRELA (RELA) offsets
-			for i := range r.JmpRela {
-				if r.BaseAddr != 0 && r.JmpRela[i].Offset >= r.BaseAddr {
-					r.JmpRela[i].Offset -= r.BaseAddr
-				}
+			r.logger.Info("jmprel read", "vaddr", r.jmprelVaddr, "count", jmprelCount, "type", "rela")
+			if r.JmpRela, err = readArray[Elf64_Rela](r.File, fileOffset, jmprelCount, "DT_JMPRELA"); err != nil {
+				return err
 			}
+			r.normalizeRelaOffsets(r.JmpRela)
+		default:
+			return fmt.Errorf("DT_JMPREL:bad_entry_size entry_size=%d", r.jmprelEntrySize)
 		}
 	}
 
 	return nil
 }
+
+// maxSymbolChainWalk caps the GNU-hash chain walk so a corrupt/looping chain
+// can't spin indefinitely. It is a sanity bound, not a spec limit.
+const maxSymbolChainWalk = 1_000_000
 
 // calculateSymbolCount determines the total number of symbols using hash tables
 func (r *ElfReader) calculateSymbolCount() (uint64, error) {
@@ -558,12 +680,12 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 	if r.hashVaddr != 0 {
 		fileOffset := r.vaddrToOffset(r.hashVaddr)
 		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("hash:seek | %w", err)
+			return 0, fmt.Errorf("hash:seek: %w", err)
 		}
 
 		var header HashHeader
 		if err := binary.Read(r.File, binary.LittleEndian, &header); err != nil {
-			return 0, fmt.Errorf("hash:read | %w", err)
+			return 0, fmt.Errorf("hash:read: %w", err)
 		}
 
 		return uint64(header.Nchain), nil
@@ -575,12 +697,12 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 		r.logger.Debug("gnuhash read", "vaddr", r.gnuHashVaddr, "offset", fileOffset)
 
 		if _, err := r.File.Seek(int64(fileOffset), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("gnu_hash:seek | %w", err)
+			return 0, fmt.Errorf("gnu_hash:seek: %w", err)
 		}
 
 		var header GNUHashHeader
 		if err := binary.Read(r.File, binary.LittleEndian, &header); err != nil {
-			return 0, fmt.Errorf("gnu_hash:read | %w", err)
+			return 0, fmt.Errorf("gnu_hash:read: %w", err)
 		}
 
 		// Guard against corrupt headers that would allocate excessive memory
@@ -596,26 +718,49 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 		// Read buckets
 		buckets := make([]uint32, header.Nbuckets)
 		if _, err := r.File.Seek(int64(r.vaddrToOffset(bucketsAddr)), io.SeekStart); err != nil {
-			return 0, fmt.Errorf("gnu_hash:buckets_seek | %w", err)
+			return 0, fmt.Errorf("gnu_hash:buckets_seek: %w", err)
 		}
 		if err := binary.Read(r.File, binary.LittleEndian, buckets); err != nil {
-			return 0, fmt.Errorf("gnu_hash:buckets_read | %w", err)
+			return 0, fmt.Errorf("gnu_hash:buckets_read: %w", err)
 		}
 
 		// Scan ALL non-zero bucket chains to find the true maximum symbol index.
 		// A bucket with a lower starting index can have a longer chain that extends
 		// past the highest bucket's starting index.
+		//
+		// GNU hash semantics: chain entry k corresponds to symbol (symndx + k).
+		// Bit 0 of a chain value marks the LAST symbol of that bucket's chain, and
+		// that symbol is still a valid, counted symbol. The total symbol count is
+		// therefore (max terminal symbol index) + 1 — the terminal index is
+		// captured by the top-of-loop maxSymIdx update, so we must NOT increment
+		// currentSymIndex when the chain terminator is seen.
 		maxSymIdx := uint64(header.Symndx)
 		seenBuckets := make(map[uint32]bool)
+		seenChain := false
 
-		for _, bptr := range buckets {
-			if bptr == 0 || seenBuckets[bptr] {
+		// Hoist the file size out of the chain walk: it is invariant across the
+		// up-to-maxSymbolChainWalk iterations, so stat'ing it per-iteration would
+		// re-syscall needlessly.
+		var fileSize uint64
+		if info, err := r.File.Stat(); err == nil {
+			fileSize = uint64(info.Size())
+		}
+
+		for _, startSymIdx := range buckets {
+			if startSymIdx == 0 || seenBuckets[startSymIdx] {
 				continue
 			}
-			seenBuckets[bptr] = true
+			if startSymIdx < header.Symndx {
+				return 0, fmt.Errorf("gnu_hash:bad_bucket bucket=%d symndx=%d", startSymIdx, header.Symndx)
+			}
+			seenBuckets[startSymIdx] = true
+			seenChain = true
 
-			currentSymIndex := uint64(bptr)
-			for currentSymIndex < 1000000 {
+			currentSymIndex := uint64(startSymIdx)
+			for currentSymIndex < maxSymbolChainWalk {
+				// Record this symbol index before reading its chain entry. If this
+				// entry turns out to be the chain terminator, this index is the
+				// last (and still valid) symbol of the chain.
 				if currentSymIndex > maxSymIdx {
 					maxSymIdx = currentSymIndex
 				}
@@ -623,8 +768,7 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 				chainFileOffset := r.vaddrToOffset(chainsAddr + chainIndex*4)
 
 				// Bound check: don't read past file
-				fileInfo, _ := r.File.Stat()
-				if fileInfo != nil && chainFileOffset+4 > uint64(fileInfo.Size()) {
+				if fileSize != 0 && chainFileOffset+4 > fileSize {
 					break
 				}
 
@@ -636,18 +780,19 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 					break
 				}
 
-				// Bit 0 = 1 marks end of chain
+				// Bit 0 = 1 marks end of chain. The current symbol index (already
+				// recorded above) is the terminal symbol and is counted; do not
+				// advance past it, or the result over-counts by one.
 				if (chainVal & 1) != 0 {
-					currentSymIndex++
-					if currentSymIndex > maxSymIdx {
-						maxSymIdx = currentSymIndex
-					}
 					break
 				}
 				currentSymIndex++
 			}
 		}
 
+		if !seenChain {
+			return uint64(header.Symndx), nil
+		}
 		return maxSymIdx + 1, nil
 	}
 
@@ -707,7 +852,7 @@ func (r *ElfReader) ResolveMetadata() {
 			r.logger.Info("soname read", "name", r.soname)
 		case DT_RUNPATH, DT_RPATH:
 			r.runpath = r.readStrtabString(uint32(entry.Val))
-			r.logger.Info("runpath read", "tag", entry.Tag.Text(), "path", r.runpath)
+			r.logger.Info("runpath read", "tag", entry.Tag.String(), "path", r.runpath)
 		}
 	}
 
@@ -726,18 +871,25 @@ func (r *ElfReader) ResolveMetadata() {
 // the classic REL/RELA tables, so all four are scanned.
 func (r *ElfReader) calculateGotBounds() {
 	minGot := ^uint64(0)
-	maxGot := uint64(0)
+	maxGotEnd := uint64(0)
 	found := false
 
 	consider := func(ttype uint32, offset uint64) {
-		if RelocationType(ttype) != R_AARCH64_GLOB_DAT {
+		var width uint64
+		switch RelocationType(ttype) {
+		case R_AARCH64_GLOB_DAT:
+			width = sizeofPtr
+		case R_AARCH64_TLSDESC:
+			width = 2 * sizeofPtr // two-word TLS descriptor
+		default:
 			return
 		}
 		if offset < minGot {
 			minGot = offset
 		}
-		if offset > maxGot {
-			maxGot = offset
+		end := offset + width
+		if end > maxGotEnd {
+			maxGotEnd = end
 		}
 		found = true
 	}
@@ -755,16 +907,16 @@ func (r *ElfReader) calculateGotBounds() {
 
 	if found {
 		r.gotVaddr = minGot
-		// Size covers from min to max + 8 bytes (ptr size)
-		r.gotSize = (maxGot - minGot) + 8
+		r.gotSize = maxGotEnd - minGot
 		r.logger.Debug("got calc", "start", r.gotVaddr, "size", r.gotSize)
 	}
 
 	// Calculate .got.plt size if we have PLT relocs
 	if r.pltGotVaddr != 0 && r.jmprelSize > 0 && r.jmprelEntrySize > 0 {
-		// Size = (entries * 8) + 3 reserved entries (24 bytes)
+		// Size = one slot per PLT entry + 3 linker-reserved leading slots.
+		const pltGotReservedSlots = 3
 		count := r.jmprelSize / r.jmprelEntrySize
-		r.pltGotSize = (count * 8) + 24
+		r.pltGotSize = (count + pltGotReservedSlots) * sizeofPtr
 		r.logger.Debug("gotplt calc", "start", r.pltGotVaddr, "size", r.pltGotSize)
 	}
 }
@@ -815,15 +967,56 @@ func (r *ElfReader) readStrtabString(nameOffset uint32) string {
 	return string(buf)
 }
 
+const (
+	packedRelocMaxDecoded = 10_000_000
+
+	packedGroupedByInfo        int64 = 1 // RELOCATION_GROUPED_BY_INFO_FLAG
+	packedGroupedByOffsetDelta int64 = 2 // RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
+	packedGroupedByAddend      int64 = 4 // RELOCATION_GROUPED_BY_ADDEND_FLAG
+	packedGroupHasAddend       int64 = 8 // RELOCATION_GROUP_HAS_ADDEND_FLAG
+	packedGroupFlagMask              = packedGroupedByInfo | packedGroupedByOffsetDelta | packedGroupedByAddend | packedGroupHasAddend
+)
+
+func validatePackedGroupFlags(name string, flags int64) error {
+	if flags < 0 || flags&^packedGroupFlagMask != 0 {
+		return fmt.Errorf("%s:bad_group_flags flags=0x%x", name, flags)
+	}
+	return nil
+}
+
+func checkedInt64Add(name string, a int64, b int64) (int64, error) {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	const minInt64 = -maxInt64 - 1
+	if (b > 0 && a > maxInt64-b) || (b < 0 && a < minInt64-b) {
+		return 0, fmt.Errorf("%s:overflow lhs=%d rhs=%d", name, a, b)
+	}
+	return a + b, nil
+}
+
+// slebCursor reads a sequence of SLEB128 values from a packed relocation blob,
+// tracking position and producing consistent bad_sleb errors.
+type slebCursor struct {
+	buf  []byte
+	pos  int
+	name string
+}
+
+func (c *slebCursor) read(field string) (int64, error) {
+	v, n, ok := decodeSLEB128Checked(c.buf[c.pos:])
+	if !ok {
+		return 0, fmt.Errorf("%s:%s:bad_sleb pos=%d remaining=%d", c.name, field, c.pos, len(c.buf)-c.pos)
+	}
+	c.pos += n
+	return v, nil
+}
+
 // decodePackedRela decodes APS2/APA1 packed relocations (DT_ANDROID_RELA) into Elf64_Rela entries.
-// Format: 4-byte magic ("APS2" or "APA1"), then SLEB128-encoded relocation data.
+// APS2 matches bionic's packed_reloc_iterator: offsets and RELA addends are cumulative state.
 func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Rela, error) {
 	buf, err := r.readBoundedBlob(fileOffset, size, "android_rela")
 	if err != nil {
 		return nil, err
 	}
-
-	// Check magic header
 	if len(buf) < 4 {
 		return nil, fmt.Errorf("android_rela:too_short size=%d", len(buf))
 	}
@@ -832,133 +1025,54 @@ func (r *ElfReader) decodePackedRela(fileOffset uint64, size uint64) ([]Elf64_Re
 		return nil, fmt.Errorf("android_rela:bad_magic got=%q", magic)
 	}
 
-	pos := 4
-	var result []Elf64_Rela
-
 	if magic == "APA1" {
-		// APA1 format: pairs count, then (offset_delta, addend_delta) pairs
-		pairs, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		if pairs < 0 || uint64(pairs) > uint64(len(buf)) {
-			return nil, fmt.Errorf("android_rela:bad_pairs pairs=%d buf=%d", pairs, len(buf))
-		}
-		var offset, addend int64
-		for i := int64(0); i < pairs; i++ {
-			odelta, n1 := DecodeSLEB128(buf[pos:])
-			pos += n1
-			adelta, n2 := DecodeSLEB128(buf[pos:])
-			pos += n2
-			offset += odelta
-			addend += adelta
-
-			rela := Elf64_Rela{
-				Offset: uint64(offset),
-				Info:   uint64(R_AARCH64_RELATIVE),
-				Addend: addend,
-			}
-			if r.BaseAddr != 0 && rela.Offset >= r.BaseAddr {
-				rela.Offset -= r.BaseAddr
-			}
-			result = append(result, rela)
-		}
-	} else {
-		// APS2 format: count, initial_offset, then grouped relocations
-		relocCount, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		if relocCount < 0 || uint64(relocCount) > uint64(len(buf)) {
-			return nil, fmt.Errorf("android_rela:bad_count count=%d buf=%d", relocCount, len(buf))
-		}
-
-		// BUGFIX: Read initial offset after count (was previously skipped)
-		initialOffset, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		var offset int64 = initialOffset
-		var addend int64
-
-		const (
-			groupedByInfo        = 1 // RELOCATION_GROUPED_BY_INFO_FLAG
-			groupedByOffsetDelta = 2 // RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
-			groupedByAddend      = 4 // RELOCATION_GROUPED_BY_ADDEND_FLAG
-			groupHasAddend       = 8 // RELOCATION_GROUP_HAS_ADDEND_FLAG
-		)
-
-		for len(result) < int(relocCount) && pos < len(buf) {
-			// Read group header
-			groupSize, n1 := DecodeSLEB128(buf[pos:])
-			pos += n1
-			groupFlags, n2 := DecodeSLEB128(buf[pos:])
-			pos += n2
-
-			// Read group-level shared values
-			var groupOffsetDelta int64
-			if (groupFlags & groupedByOffsetDelta) != 0 {
-				groupOffsetDelta, n = DecodeSLEB128(buf[pos:])
-				pos += n
-			}
-
-			var groupInfo int64
-			if (groupFlags & groupedByInfo) != 0 {
-				groupInfo, n = DecodeSLEB128(buf[pos:])
-				pos += n
-			}
-
-			// BUGFIX: Only read addend when groupHasAddend flag is set.
-			// If flag 8 is clear, entries have NO addends at all.
-			entriesHaveAddends := (groupFlags & groupHasAddend) != 0
-
-			if entriesHaveAddends {
-				if (groupFlags & groupedByAddend) != 0 {
-					// All entries share the same addend
-					groupAddend, n := DecodeSLEB128(buf[pos:])
-					pos += n
-					addend = groupAddend
-				} else {
-					// No group addend; per-entry deltas starting from 0
-					addend = 0
-				}
-			} else {
-				addend = 0
-			}
-
-			// Emit entries within this group
-			for i := int64(0); i < groupSize && pos < len(buf); i++ {
-				var entryOffsetDelta int64
-				if (groupFlags & groupedByOffsetDelta) != 0 {
-					entryOffsetDelta = groupOffsetDelta
-				} else {
-					entryOffsetDelta, n = DecodeSLEB128(buf[pos:])
-					pos += n
-				}
-				offset += entryOffsetDelta
-
-				var entryInfo int64
-				if (groupFlags & groupedByInfo) != 0 {
-					entryInfo = groupInfo
-				} else {
-					entryInfo, n = DecodeSLEB128(buf[pos:])
-					pos += n
-				}
-
-				if entriesHaveAddends && (groupFlags&groupedByAddend) == 0 {
-					var addendDelta int64
-					addendDelta, n = DecodeSLEB128(buf[pos:])
-					pos += n
-					addend += addendDelta
-				}
-
-				rela := Elf64_Rela{
-					Offset: uint64(offset),
-					Info:   uint64(entryInfo),
-					Addend: addend,
-				}
-				if r.BaseAddr != 0 && rela.Offset >= r.BaseAddr {
-					rela.Offset -= r.BaseAddr
-				}
-				result = append(result, rela)
-			}
-		}
+		return r.decodeAPA1Rela(buf)
 	}
 
+	var result []Elf64_Rela
+	err = r.decodeAPS2Groups(buf, "android_rela", true, func(offset, info uint64, addend int64) error {
+		result = append(result, Elf64_Rela{Offset: offset, Info: info, Addend: addend})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// decodeAPA1Rela decodes the APA1 (offset-delta / addend-delta pair) RELA stream.
+func (r *ElfReader) decodeAPA1Rela(buf []byte) ([]Elf64_Rela, error) {
+	c := &slebCursor{buf: buf, pos: 4, name: "android_rela"}
+	pairs, err := c.read("pairs")
+	if err != nil {
+		return nil, err
+	}
+	if pairs < 0 || pairs > packedRelocMaxDecoded {
+		return nil, fmt.Errorf("android_rela:bad_pairs pairs=%d", pairs)
+	}
+	var result []Elf64_Rela
+	var offset, addend int64
+	for i := int64(0); i < pairs; i++ {
+		odelta, err := c.read("offset_delta")
+		if err != nil {
+			return nil, err
+		}
+		adelta, err := c.read("addend_delta")
+		if err != nil {
+			return nil, err
+		}
+		if offset, err = checkedInt64Add("android_rela:offset", offset, odelta); err != nil {
+			return nil, err
+		}
+		if addend, err = checkedInt64Add("android_rela:addend", addend, adelta); err != nil {
+			return nil, err
+		}
+		normOffset, err := r.normalizePackedRelocOffset(offset, "android_rela")
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, Elf64_Rela{Offset: normOffset, Info: uint64(R_AARCH64_RELATIVE), Addend: addend})
+	}
 	return result, nil
 }
 
@@ -968,7 +1082,6 @@ func (r *ElfReader) decodePackedRel(fileOffset uint64, size uint64) ([]Elf64_Rel
 	if err != nil {
 		return nil, err
 	}
-
 	if len(buf) < 4 {
 		return nil, fmt.Errorf("android_rel:too_short size=%d", len(buf))
 	}
@@ -977,112 +1090,223 @@ func (r *ElfReader) decodePackedRel(fileOffset uint64, size uint64) ([]Elf64_Rel
 		return nil, fmt.Errorf("android_rel:bad_magic got=%q", magic)
 	}
 
-	pos := 4
-	var result []Elf64_Rel
-
 	if magic == "APR1" {
-		// APR1: initial offset, then (count, delta) pairs
-		pairs, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		if pairs < 0 || uint64(pairs) > uint64(len(buf)) {
-			return nil, fmt.Errorf("android_rel:bad_pairs pairs=%d buf=%d", pairs, len(buf))
+		return r.decodeAPR1Rel(buf)
+	}
+
+	var result []Elf64_Rel
+	err = r.decodeAPS2Groups(buf, "android_rel", false, func(offset, info uint64, _ int64) error {
+		result = append(result, Elf64_Rel{Offset: offset, Info: info})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// decodeAPR1Rel decodes the APR1 (run-length count / delta pair) REL stream.
+func (r *ElfReader) decodeAPR1Rel(buf []byte) ([]Elf64_Rel, error) {
+	c := &slebCursor{buf: buf, pos: 4, name: "android_rel"}
+	pairs, err := c.read("pairs")
+	if err != nil {
+		return nil, err
+	}
+	if pairs < 0 || pairs > packedRelocMaxDecoded {
+		return nil, fmt.Errorf("android_rel:bad_pairs pairs=%d", pairs)
+	}
+	addr, err := c.read("initial_offset")
+	if err != nil {
+		return nil, err
+	}
+
+	var result []Elf64_Rel
+	appendRel := func(offset int64) error {
+		normOffset, err := r.normalizePackedRelocOffset(offset, "android_rel")
+		if err != nil {
+			return err
 		}
-		addr, n2 := DecodeSLEB128(buf[pos:])
-		pos += n2
-
-		// Emit first relocation
-		rel := Elf64_Rel{Offset: uint64(addr), Info: uint64(R_AARCH64_RELATIVE)}
-		if r.BaseAddr != 0 && rel.Offset >= r.BaseAddr {
-			rel.Offset -= r.BaseAddr
+		result = append(result, Elf64_Rel{Offset: normOffset, Info: uint64(R_AARCH64_RELATIVE)})
+		return nil
+	}
+	if err := appendRel(addr); err != nil {
+		return nil, err
+	}
+	for i := int64(0); i < pairs; i++ {
+		count, err := c.read("pair_count")
+		if err != nil {
+			return nil, err
 		}
-		result = append(result, rel)
-
-		for i := int64(0); i < pairs; i++ {
-			count, n1 := DecodeSLEB128(buf[pos:])
-			pos += n1
-			delta, n3 := DecodeSLEB128(buf[pos:])
-			pos += n3
-			if count < 0 || uint64(count) > uint64(len(buf)) {
-				return nil, fmt.Errorf("android_rel:bad_pair_count count=%d buf=%d", count, len(buf))
-			}
-			for j := int64(0); j < count; j++ {
-				addr += delta
-				rel := Elf64_Rel{Offset: uint64(addr), Info: uint64(R_AARCH64_RELATIVE)}
-				if r.BaseAddr != 0 && rel.Offset >= r.BaseAddr {
-					rel.Offset -= r.BaseAddr
-				}
-				result = append(result, rel)
-			}
+		delta, err := c.read("pair_delta")
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		// APS2: count, initial_offset, then grouped relocations (no addends)
-		relocCount, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		if relocCount < 0 || uint64(relocCount) > uint64(len(buf)) {
-			return nil, fmt.Errorf("android_rel:bad_count count=%d buf=%d", relocCount, len(buf))
+		if count < 0 || count > packedRelocMaxDecoded || int64(len(result))+count > packedRelocMaxDecoded {
+			return nil, fmt.Errorf("android_rel:bad_pair_count count=%d", count)
 		}
-
-		// BUGFIX: Read initial offset after count (was previously skipped)
-		initialOffset, n := DecodeSLEB128(buf[pos:])
-		pos += n
-		var offset int64 = initialOffset
-
-		const (
-			groupedByInfo        = 1 // RELOCATION_GROUPED_BY_INFO_FLAG
-			groupedByOffsetDelta = 2 // RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG
-		)
-
-		for len(result) < int(relocCount) && pos < len(buf) {
-			groupSize, n1 := DecodeSLEB128(buf[pos:])
-			pos += n1
-			groupFlags, n2 := DecodeSLEB128(buf[pos:])
-			pos += n2
-
-			var groupOffsetDelta int64
-			if (groupFlags & groupedByOffsetDelta) != 0 {
-				groupOffsetDelta, n = DecodeSLEB128(buf[pos:])
-				pos += n
+		for j := int64(0); j < count; j++ {
+			if addr, err = checkedInt64Add("android_rel:offset", addr, delta); err != nil {
+				return nil, err
 			}
-
-			var groupInfo int64
-			if (groupFlags & groupedByInfo) != 0 {
-				groupInfo, n = DecodeSLEB128(buf[pos:])
-				pos += n
-			}
-
-			for i := int64(0); i < groupSize && pos < len(buf); i++ {
-				var entryOffsetDelta int64
-				if (groupFlags & groupedByOffsetDelta) != 0 {
-					entryOffsetDelta = groupOffsetDelta
-				} else {
-					entryOffsetDelta, n = DecodeSLEB128(buf[pos:])
-					pos += n
-				}
-				offset += entryOffsetDelta
-
-				var entryInfo int64
-				if (groupFlags & groupedByInfo) != 0 {
-					entryInfo = groupInfo
-				} else {
-					entryInfo, n = DecodeSLEB128(buf[pos:])
-					pos += n
-				}
-
-				rel := Elf64_Rel{Offset: uint64(offset), Info: uint64(entryInfo)}
-				if r.BaseAddr != 0 && rel.Offset >= r.BaseAddr {
-					rel.Offset -= r.BaseAddr
-				}
-				result = append(result, rel)
+			if err := appendRel(addr); err != nil {
+				return nil, err
 			}
 		}
 	}
-
 	return result, nil
+}
+
+// decodeAPS2Groups decodes the APS2 grouped relocation stream shared by the REL
+// and RELA packed decoders. When allowAddend is false any addend group flag is
+// rejected (REL relocations carry no addend). Each decoded entry is passed to
+// emit with its offset already normalized to a module-relative vaddr.
+func (r *ElfReader) decodeAPS2Groups(buf []byte, name string, allowAddend bool, emit func(offset, info uint64, addend int64) error) error {
+	c := &slebCursor{buf: buf, pos: 4, name: name}
+
+	relocCount, err := c.read("reloc_count")
+	if err != nil {
+		return err
+	}
+	if relocCount < 0 || relocCount > packedRelocMaxDecoded {
+		return fmt.Errorf("%s:bad_count count=%d", name, relocCount)
+	}
+	offset, err := c.read("initial_offset")
+	if err != nil {
+		return err
+	}
+	var addend int64
+	var emitted int64
+
+	for emitted < relocCount {
+		groupSize, err := c.read("group_size")
+		if err != nil {
+			return err
+		}
+		groupFlags, err := c.read("group_flags")
+		if err != nil {
+			return err
+		}
+		if err := validatePackedGroupFlags(name, groupFlags); err != nil {
+			return err
+		}
+		if groupSize <= 0 {
+			return fmt.Errorf("%s:bad_group_size size=%d", name, groupSize)
+		}
+		if groupSize > relocCount-emitted {
+			return fmt.Errorf("%s:group_overflow size=%d remaining=%d", name, groupSize, relocCount-emitted)
+		}
+		if !allowAddend && (groupFlags&(packedGroupedByAddend|packedGroupHasAddend)) != 0 {
+			return fmt.Errorf("%s:unexpected_addend flags=0x%x", name, groupFlags)
+		}
+
+		var groupOffsetDelta int64
+		if (groupFlags & packedGroupedByOffsetDelta) != 0 {
+			if groupOffsetDelta, err = c.read("group_offset_delta"); err != nil {
+				return err
+			}
+		}
+
+		var groupInfo int64
+		if (groupFlags & packedGroupedByInfo) != 0 {
+			if groupInfo, err = c.read("group_info"); err != nil {
+				return err
+			}
+			if groupInfo < 0 {
+				return fmt.Errorf("%s:bad_group_info info=%d", name, groupInfo)
+			}
+		}
+
+		entriesHaveAddends := allowAddend && (groupFlags&packedGroupHasAddend) != 0
+		entriesShareAddend := allowAddend && (groupFlags&packedGroupedByAddend) != 0
+		if entriesShareAddend && !entriesHaveAddends {
+			return fmt.Errorf("%s:grouped_addend_without_addend flags=0x%x", name, groupFlags)
+		}
+		if entriesHaveAddends && entriesShareAddend {
+			groupAddendDelta, err := c.read("group_addend_delta")
+			if err != nil {
+				return err
+			}
+			if addend, err = checkedInt64Add(name+":addend", addend, groupAddendDelta); err != nil {
+				return err
+			}
+		} else if !entriesHaveAddends {
+			addend = 0
+		}
+
+		for i := int64(0); i < groupSize; i++ {
+			if (groupFlags & packedGroupedByOffsetDelta) != 0 {
+				if offset, err = checkedInt64Add(name+":offset", offset, groupOffsetDelta); err != nil {
+					return err
+				}
+			} else {
+				entryOffsetDelta, err := c.read("entry_offset_delta")
+				if err != nil {
+					return err
+				}
+				if offset, err = checkedInt64Add(name+":offset", offset, entryOffsetDelta); err != nil {
+					return err
+				}
+			}
+
+			entryInfo := groupInfo
+			if (groupFlags & packedGroupedByInfo) == 0 {
+				if entryInfo, err = c.read("entry_info"); err != nil {
+					return err
+				}
+				if entryInfo < 0 {
+					return fmt.Errorf("%s:bad_entry_info info=%d", name, entryInfo)
+				}
+			}
+
+			if entriesHaveAddends && !entriesShareAddend {
+				addendDelta, err := c.read("entry_addend_delta")
+				if err != nil {
+					return err
+				}
+				if addend, err = checkedInt64Add(name+":addend", addend, addendDelta); err != nil {
+					return err
+				}
+			}
+
+			normOffset, err := r.normalizePackedRelocOffset(offset, name)
+			if err != nil {
+				return err
+			}
+			if err := emit(normOffset, uint64(entryInfo), addend); err != nil {
+				return err
+			}
+			emitted++
+		}
+	}
+
+	return nil
+}
+
+func (r *ElfReader) normalizePackedRelocOffset(offset int64, name string) (uint64, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("%s:negative_offset offset=%d", name, offset)
+	}
+	u := uint64(offset)
+	if normalized, ok := r.normalizeLoadedAddress(u); ok {
+		u = normalized
+		switch name {
+		case "android_rel":
+			r.androidRelDirty = true
+		case "android_rela":
+			r.androidRelaDirty = true
+		}
+	}
+	return u, nil
 }
 
 // DecodeSLEB128 decodes a signed LEB128 value from buf, returning the value and bytes consumed.
 // Bails after 10 bytes (the max needed to encode an int64) to avoid spinning on corrupt input.
 func DecodeSLEB128(buf []byte) (int64, int) {
+	v, n, _ := decodeSLEB128Checked(buf)
+	return v, n
+}
+
+func decodeSLEB128Checked(buf []byte) (int64, int, bool) {
 	const maxBytes = 10
 	var result int64
 	var shift uint
@@ -1100,14 +1324,13 @@ func DecodeSLEB128(buf []byte) (int64, int) {
 			if shift < 64 && (b&0x40) != 0 {
 				result |= -(1 << shift)
 			}
-			return result, i + 1
+			return result, i + 1, true
 		}
 	}
-	return result, limit
+	return result, limit, false
 }
 
-// readBoundedBlob reads `size` bytes at `fileOffset`, clamping `size` to the
-// remaining file length to guard against corrupt sizing fields.
+// readBoundedBlob reads exactly `size` bytes at `fileOffset`.
 func (r *ElfReader) readBoundedBlob(fileOffset uint64, size uint64, name string) ([]byte, error) {
 	if size == 0 {
 		return nil, fmt.Errorf("%s:zero_size", name)
@@ -1119,13 +1342,12 @@ func (r *ElfReader) readBoundedBlob(fileOffset uint64, size uint64, name string)
 		}
 		remaining := fileSize - fileOffset
 		if size > remaining {
-			r.logger.Warn("blob clamp", "name", name, "requested", size, "max", remaining)
-			size = remaining
+			return nil, fmt.Errorf("%s:truncated_blob requested=%d remaining=%d", name, size, remaining)
 		}
 	}
 	buf := make([]byte, size)
-	if _, err := r.File.ReadAt(buf, int64(fileOffset)); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("%s:read_raw | %w", name, err)
+	if _, err := r.File.ReadAt(buf, int64(fileOffset)); err != nil {
+		return nil, fmt.Errorf("%s:read_raw: %w", name, err)
 	}
 	return buf, nil
 }

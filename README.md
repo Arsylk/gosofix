@@ -11,11 +11,11 @@ gosofix processes memory-dumped `.so` files from Android processes and normalize
 ### Key Features
 
 - **ELF 64-bit ARM64 Support**: Specialized for Android shared objects.
-- **Robust Relocation Normalization**: Handles `ABS64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE` relocations. Automatically detects and normalizes "dirty" addends in memory dumps (absolute pointers poisoned by runtime linkers).
-- **Accurate PC-Relative Fixes**: Properly handles `R_AARCH64_PREL64` using virtual addresses.
-- **APS2/APA1 & RELR Support**: Full support for Android packed relocations (SLEB128 and bitmap formats).
+- **Robust Relocation Normalization**: Handles `ABS64`, `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE`, and related 64-bit data relocations while preserving runtime-only slots where inverse relocation is unsafe.
+- **Accurate PC-Relative Handling**: Preserves `R_AARCH64_PREL64` slots because `S + A - P` is already base-invariant in a dumped image.
+- **APS2/APA1 & RELR Support**: Decodes Android packed relocations and RELR bitmap relocations; packed streams that would require re-encoding are rejected rather than rewritten incorrectly.
 - **Preserved Runtime Data**: Reconstructs `.bss` as `PROGBITS` to preserve values initialized at runtime (e.g., by packers).
-- **Intelligent Section Reconstruction**: Automatically identifies gaps between known structures and creates descriptive placeholder sections (`.text.gap_N`, `.data.gap_N`) to ensure full coverage in static analysis tools.
+- **Intelligent Section Reconstruction**: Rebuilds metadata sections and PT_LOAD-backed coverage sections (`.text`, `.ro`, `.rw`) so static analysis tools can recover the image layout.
 - **Post-Fix Verification**: Built-in sanity checker validates headers, segment consistency, and scans for residual absolute addresses.
 - **Page Alignment Support**: Detects and maintains 4KB/16KB/64KB alignment found in dumped segments.
 - **Dual interface** — Available as CLI binary and shared library (for integration via `dlopen`)
@@ -145,7 +145,7 @@ Memory dumps capture the **post-relocation** state with live runtime data. gosof
 ## 🔬 Testing
 
 ```bash
-# Run full test suite (5 diverse samples + build verification)
+# Run full test suite (8 diverse samples + build verification)
 xmake test
 ```
 

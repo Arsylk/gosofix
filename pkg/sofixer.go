@@ -33,13 +33,13 @@ func buildStyles() *log.Styles {
 		}
 		return v
 	})
-	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "start", "handle", "mmap_addr", "mmap_region", "input_path", "output_path", "path"} {
+	for _, key := range []string{"vaddr", "paddr", "addr", "offset", "base", "from", "to", "end", "start", "handle", "mmap_addr", "mmap_region"} {
 		s.Values[key] = hexTransform
 	}
 	for _, key := range []string{"index", "size", "memory_size", "file_size", "count", "entry_count", "entries", "total_size", "expected_count", "actual_count", "decoded_count", "section_count", "symbol_count", "program_header_count"} {
 		s.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#CBA6F7"))
 	}
-	for _, key := range []string{"type", "tag", "reloc", "bind", "flags", "level"} {
+	for _, key := range []string{"type", "reloc", "bind", "flags", "level"} {
 		s.Values[key] = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
 	}
 	for _, key := range []string{"file", "path", "runpath", "input_path", "output_path"} {
@@ -119,19 +119,18 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 
 	// Post-fix verification on the closed output file
 	var issues []string
-	if info, statErr := os.Stat(outputPath); statErr == nil {
-		issues = CheckFixedElf(lg, outputPath, baseAddr, uint64(info.Size()))
+	if _, statErr := os.Stat(outputPath); statErr == nil {
+		issues = CheckFixedElf(lg, outputPath, baseAddr)
 	}
 
 	lg.Info("elf fin", "output_path", outputPath)
 	return issues, nil
 }
 
-// readArray reads up to 'count' elements of type T from file at the given offset.
-// Returns the successfully read elements. On EOF, returns partial results without error.
-// count is clamped against the remaining file size to defend against corrupt sizing
-// fields that would otherwise trigger an OOM allocation.
-func readArray[T any](lg *log.Logger, file *os.File, offset uint64, count uint64, name string) ([]T, error) {
+// readArray reads exactly 'count' elements of type T from file at the given
+// offset. A truncated table is a fatal format error; callers depend on the
+// returned slice length matching the advertised ELF metadata.
+func readArray[T any](file *os.File, offset uint64, count uint64, name string) ([]T, error) {
 	if count == 0 {
 		return []T{}, nil
 	}
@@ -149,44 +148,18 @@ func readArray[T any](lg *log.Logger, file *os.File, offset uint64, count uint64
 		}
 		maxCount := (fileSize - offset) / elemSize
 		if count > maxCount {
-			lg.Warn("readArray clamp", "name", name, "requested", count, "max", maxCount)
-			count = maxCount
+			return nil, fmt.Errorf("readArray %s: truncated table requested=%d max=%d elem_size=%d", name, count, maxCount, elemSize)
 		}
-	}
-
-	if count == 0 {
-		return []T{}, nil
 	}
 
 	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
 	}
 
-	// Try to read the full array first (most efficient for common case)
 	array := make([]T, count)
-	if err := binary.Read(file, binary.LittleEndian, array); err == nil {
-		return array, nil
+	if err := binary.Read(file, binary.LittleEndian, array); err != nil {
+		return nil, fmt.Errorf("failed to read %s at 0x%x count=%d: %w", name, offset, count, err)
 	}
 
-	// On error, fall back to reading element by element for partial results
-	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to %s at 0x%x: %w", name, offset, err)
-	}
-
-	result := make([]T, 0, count)
-	for i := range count {
-		var elem T
-		if err := binary.Read(file, binary.LittleEndian, &elem); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				if len(result) > 0 {
-					lg.Warn("partial read", "name", name, "expected_count", count, "actual_count", len(result))
-				}
-				return result, nil
-			}
-			return nil, fmt.Errorf("failed to read %s element %d at 0x%x: %w", name, i, offset, err)
-		}
-		result = append(result, elem)
-	}
-
-	return result, nil
+	return array, nil
 }

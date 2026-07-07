@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/charmbracelet/log"
-	"github.com/ianlancetaylor/demangle"
 )
 
 // elfMetadata holds parsed ELF structures for granular address resolution.
@@ -28,10 +27,10 @@ type resolvedSymbol struct {
 
 // CheckFixedElf opens the output ELF and runs post-fix sanity checks.
 // Logs diagnostics using the supplied logger. Returns issues found.
-func CheckFixedElf(lg *log.Logger, path string, baseAddr uint64, totalSize uint64) []string {
+func CheckFixedElf(lg *log.Logger, path string, baseAddr uint64) []string {
 	file, err := os.Open(path)
 	if err != nil {
-		lg.Error("check:open", "path", path, "err", err)
+		lg.Error("check:open", "path", path, "error", err)
 		return []string{fmt.Sprintf("failed to open: %v", err)}
 	}
 	defer file.Close()
@@ -51,7 +50,7 @@ func CheckFixedElf(lg *log.Logger, path string, baseAddr uint64, totalSize uint6
 
 	// 3. Residual absolute addresses in data segments
 	if baseAddr != 0 {
-		residuals := scanResidualAddresses(lg, file, meta, baseAddr, totalSize)
+		residuals := scanResidualAddresses(lg, file, meta, baseAddr)
 		issues = append(issues, residuals...)
 	}
 
@@ -137,7 +136,13 @@ func readElfMetadata(lg *log.Logger, file *os.File) (*elfMetadata, []string) {
 func (m *elfMetadata) readSymbols(file *os.File, sh Elf64_Shdr) ([]resolvedSymbol, []string) {
 	var issues []string
 	if sh.Entsize == 0 {
-		return nil, nil
+		return nil, []string{"symbols:bad_entsize zero"}
+	}
+	if sh.Entsize != uint64(sizeofSym) {
+		return nil, []string{fmt.Sprintf("symbols:bad_entsize got=%d want=%d", sh.Entsize, sizeofSym)}
+	}
+	if sh.Size%sh.Entsize != 0 {
+		return nil, []string{fmt.Sprintf("symbols:bad_size size=%d entsize=%d", sh.Size, sh.Entsize)}
 	}
 	count := sh.Size / sh.Entsize
 	rawSyms := make([]Elf64_Sym, count)
@@ -162,19 +167,15 @@ func (m *elfMetadata) readSymbols(file *os.File, sh Elf64_Shdr) ([]resolvedSymbo
 
 	res := make([]resolvedSymbol, 0, count)
 	for _, s := range rawSyms {
-		if s.St_Name == 0 && s.St_Value == 0 {
+		if s.Name == 0 && s.Value == 0 {
 			continue
 		}
-		name := readString(strtab, s.St_Name)
-		// Demangle if it looks like a mangled name
-		if demangled, err := demangle.ToString(name); err == nil {
-			name = demangled
-		}
+		name := DemangleSymbol(readString(strtab, s.Name))
 		res = append(res, resolvedSymbol{
 			name:  name,
-			value: s.St_Value,
-			size:  s.St_Size,
-			info:  s.St_Info,
+			value: s.Value,
+			size:  s.Size,
+			info:  s.Info,
 		})
 	}
 	return res, issues
@@ -209,12 +210,11 @@ func readString(data []byte, offset uint32) string {
 }
 
 // scanResidualAddresses scans writable PT_LOAD segments for pointer-aligned
-// values that fall within [baseAddr, baseAddr+totalSize]. For each hit,
-// checks if (val - baseAddr) resolves to a legitimate offset within any
-// PT_LOAD segment, which strongly indicates a missed normalization.
-func scanResidualAddresses(lg *log.Logger, file *os.File, meta *elfMetadata, baseAddr uint64, totalSize uint64) []string {
+// values that fall within a PT_LOAD's runtime range. For each hit, checks if
+// (val - baseAddr) resolves to a legitimate offset within any PT_LOAD segment,
+// which strongly indicates a missed normalization.
+func scanResidualAddresses(lg *log.Logger, file *os.File, meta *elfMetadata, baseAddr uint64) []string {
 	var issues []string
-	upperBound := baseAddr + totalSize
 	var totalScanned, totalResiduals, totalLegitimate int
 
 	for _, p := range meta.phdrs {
@@ -231,12 +231,12 @@ func scanResidualAddresses(lg *log.Logger, file *os.File, meta *elfMetadata, bas
 
 		for off := 0; off+8 <= len(data); off += 8 {
 			val := binary.LittleEndian.Uint64(data[off : off+8])
-			if val < baseAddr || val >= upperBound {
+			rebased, ok := rebaseInLoad(meta.phdrs, baseAddr, val)
+			if !ok {
 				continue
 			}
 
 			totalResiduals++
-			rebased := val - baseAddr
 			vaddr := p.Vaddr + uint64(off)
 
 			// Check if the rebased value points into any PT_LOAD segment

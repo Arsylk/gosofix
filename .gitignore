@@ -3,3 +3,8 @@ dist/
 build/
 .xmake
 dist
+
+# Local Ghidra/GhidrAssist tool artifacts
+ghidrassist_analysis.db
+ghidrassist_rlhf.db
+ghidrassist_chat_artifacts/

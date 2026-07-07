@@ -45,49 +45,27 @@ func TestRelocationConstants(t *testing.T) {
 	}
 }
 
-func TestIsDataRelocation(t *testing.T) {
-	tests := []struct {
-		typ  sofixer.RelocationType
-		ok   bool
+func TestRelrDynamicConstants(t *testing.T) {
+	cases := []struct {
 		name string
+		got  sofixer.DT_Tag
+		want uint64
 	}{
-		{sofixer.R_AARCH64_NONE, false, "NONE"},
-		{sofixer.R_AARCH64_ABS64, true, "ABS64"},
-		{sofixer.R_AARCH64_PREL64, true, "PREL64"},
-		{sofixer.R_AARCH64_RELATIVE, true, "RELATIVE"},
-		{sofixer.R_AARCH64_GLOB_DAT, true, "GLOB_DAT"},
-		{sofixer.R_AARCH64_JUMP_SLOT, true, "JUMP_SLOT"},
-		{sofixer.R_AARCH64_COPY, true, "COPY"},
-		{sofixer.R_AARCH64_TLS_DTPMOD, true, "TLS_DTPMOD"},
-		{sofixer.R_AARCH64_TLS_DTPREL, true, "TLS_DTPREL"},
-		{sofixer.R_AARCH64_TLS_TPREL, true, "TLS_TPREL"},
-		{sofixer.R_AARCH64_TLSDESC, true, "TLSDESC"},
-		{sofixer.R_AARCH64_IRELATIVE, true, "IRELATIVE"},
-		{sofixer.R_AARCH64_CALL26, false, "CALL26"},
-		{sofixer.R_AARCH64_JUMP26, false, "JUMP26"},
-		{sofixer.R_AARCH64_ADR_PREL21, false, "ADR_PREL21"},
-		{sofixer.RelocationType(0xDEAD), false, "UNKNOWN"},
+		{"DT_RELRSZ", sofixer.DT_RELRSZ, 35},
+		{"DT_RELR", sofixer.DT_RELR, 36},
+		{"DT_RELRENT", sofixer.DT_RELRENT, 37},
+		{"DT_ANDROID_RELR", sofixer.DT_ANDROID_RELR, 0x6fffe000},
+		{"DT_ANDROID_RELRSZ", sofixer.DT_ANDROID_RELRSZ, 0x6fffe001},
+		{"DT_ANDROID_RELRENT", sofixer.DT_ANDROID_RELRENT, 0x6fffe003},
+		{"DT_ANDROID_RELRCOUNT", sofixer.DT_ANDROID_RELRCOUNT, 0x6fffe005},
 	}
-	for _, tt := range tests {
-		got := _isDataRelocationHelper(tt.typ)
-		if got != tt.ok {
-			t.Errorf("isDataRelocation(%s)=%v, want %v", tt.name, got, tt.ok)
+	for _, tc := range cases {
+		if uint64(tc.got) != tc.want {
+			t.Errorf("%s = 0x%x, want 0x%x", tc.name, uint64(tc.got), tc.want)
 		}
 	}
-}
-
-// Helper: mirrors pkg.isDataRelocation since it's unexported.
-func _isDataRelocationHelper(rt sofixer.RelocationType) bool {
-	switch rt {
-	case sofixer.R_AARCH64_NONE:
-		return false
-	case sofixer.R_AARCH64_ABS64, sofixer.R_AARCH64_PREL64, sofixer.R_AARCH64_RELATIVE,
-		sofixer.R_AARCH64_GLOB_DAT, sofixer.R_AARCH64_JUMP_SLOT, sofixer.R_AARCH64_COPY,
-		sofixer.R_AARCH64_TLS_DTPMOD, sofixer.R_AARCH64_TLS_DTPREL, sofixer.R_AARCH64_TLS_TPREL,
-		sofixer.R_AARCH64_TLSDESC, sofixer.R_AARCH64_IRELATIVE:
-		return true
-	default:
-		return false
+	if uint32(sofixer.SHT_ANDROID_RELR) != 0x6fffff00 {
+		t.Errorf("SHT_ANDROID_RELR = 0x%x, want 0x6fffff00", uint32(sofixer.SHT_ANDROID_RELR))
 	}
 }
 
@@ -202,6 +180,15 @@ func TestFixELFHeaders_ErrorPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("big endian rejected", func(t *testing.T) {
+		hdr := validElfHeader()
+		hdr[5] = 2 // ELFDATA2MSB
+		_, err := sofixer.FixELFHeaders(writeTempELF(t, hdr), 0x1000, out, 0)
+		if err == nil || !strings.Contains(err.Error(), "data encoding") {
+			t.Fatalf("expected data encoding error, got: %v", err)
+		}
+	})
+
 	t.Run("wrong architecture", func(t *testing.T) {
 		hdr := validElfHeader()
 		binary.LittleEndian.PutUint16(hdr[18:20], 62) // EM_X86_64
@@ -257,7 +244,7 @@ func TestFixELFHeaders_ErrorPaths(t *testing.T) {
 
 func TestSymbolBindType(t *testing.T) {
 	var sym sofixer.Elf64_Sym
-	sym.St_Info = (uint8(sofixer.STB_GLOBAL) << 4) | uint8(sofixer.STT_FUNC)
+	sym.Info = (uint8(sofixer.STB_GLOBAL) << 4) | uint8(sofixer.STT_FUNC)
 	if got := sym.StBind(); got != sofixer.STB_GLOBAL {
 		t.Errorf("stBind: got %v, want STB_GLOBAL", got)
 	}
@@ -279,8 +266,15 @@ func testFixAndVerify(t *testing.T, inputPath string, baseAddr uint64, label str
 		t.Fatalf("[%s] FixELFHeaders failed: %v", label, err)
 	}
 	t.Logf("[%s] output=%s", label, outputPath)
+	// Residual-pointer diagnostics are heuristic and non-fatal by design (cmd
+	// treats them as warnings). Any other verifier issue is a structural defect
+	// in the rebuilt ELF and must fail the test.
 	for _, iss := range issues {
-		t.Logf("[%s] verifier: %s", label, iss)
+		if strings.HasPrefix(iss, "residual_addrs") {
+			t.Logf("[%s] verifier (non-fatal): %s", label, iss)
+			continue
+		}
+		t.Errorf("[%s] verifier flagged structural issue: %s", label, iss)
 	}
 	info, err := os.Stat(outputPath)
 	if err != nil || info.Size() == 0 {
@@ -315,7 +309,7 @@ func TestSampleDumps(t *testing.T) {
 			t.Parallel()
 			inputPath := filepath.Join(repoRoot, s.file)
 			if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-				t.Skipf("sample %s not found", s.file)
+				t.Fatalf("committed sample %s is missing", s.file)
 			}
 
 			outputPath := testFixAndVerify(t, inputPath, s.base, s.name)
