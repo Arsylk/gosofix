@@ -762,7 +762,7 @@ func (r *ElfRebuilder) writeFixedRelocs() error {
 				}
 				// Odd entry: bitmap, each of bits 1..63 covers a pointer-width slot.
 				const relrBitmapSlots = 63 // bits per RELR word minus the flag bit
-				for i := uint(0); i < relrBitmapSlots; i++ {
+				for i := range relrBitmapSlots {
 					if (entry & (1 << (i + 1))) != 0 {
 						if err := r.patchRelrAt(where + uint64(i)*sizeofPtr); err != nil {
 							return err

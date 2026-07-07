@@ -1052,7 +1052,7 @@ func (r *ElfReader) decodeAPA1Rela(buf []byte) ([]Elf64_Rela, error) {
 	}
 	var result []Elf64_Rela
 	var offset, addend int64
-	for i := int64(0); i < pairs; i++ {
+	for range pairs {
 		odelta, err := c.read("offset_delta")
 		if err != nil {
 			return nil, err
@@ -1132,7 +1132,7 @@ func (r *ElfReader) decodeAPR1Rel(buf []byte) ([]Elf64_Rel, error) {
 	if err := appendRel(addr); err != nil {
 		return nil, err
 	}
-	for i := int64(0); i < pairs; i++ {
+	for range pairs {
 		count, err := c.read("pair_count")
 		if err != nil {
 			return nil, err
@@ -1144,7 +1144,7 @@ func (r *ElfReader) decodeAPR1Rel(buf []byte) ([]Elf64_Rel, error) {
 		if count < 0 || count > packedRelocMaxDecoded || int64(len(result))+count > packedRelocMaxDecoded {
 			return nil, fmt.Errorf("android_rel:bad_pair_count count=%d", count)
 		}
-		for j := int64(0); j < count; j++ {
+		for range count {
 			if addr, err = checkedInt64Add("android_rel:offset", addr, delta); err != nil {
 				return nil, err
 			}
@@ -1233,7 +1233,7 @@ func (r *ElfReader) decodeAPS2Groups(buf []byte, name string, allowAddend bool, 
 			addend = 0
 		}
 
-		for i := int64(0); i < groupSize; i++ {
+		for range groupSize {
 			if (groupFlags & packedGroupedByOffsetDelta) != 0 {
 				if offset, err = checkedInt64Add(name+":offset", offset, groupOffsetDelta); err != nil {
 					return err
@@ -1310,11 +1310,8 @@ func decodeSLEB128Checked(buf []byte) (int64, int, bool) {
 	const maxBytes = 10
 	var result int64
 	var shift uint
-	limit := len(buf)
-	if limit > maxBytes {
-		limit = maxBytes
-	}
-	for i := 0; i < limit; i++ {
+	limit := min(len(buf), maxBytes)
+	for i := range limit {
 		b := buf[i]
 		if shift < 64 {
 			result |= int64(b&0x7f) << shift

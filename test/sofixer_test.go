@@ -374,7 +374,7 @@ func TestSampleDumps(t *testing.T) {
 				t.Errorf("readelf --dyn-syms failed: %v", err)
 				return
 			}
-			for _, line := range strings.Split(string(symOut), "\n") {
+			for line := range strings.SplitSeq(string(symOut), "\n") {
 				fields := strings.Fields(line)
 				if len(fields) >= 8 && strings.Contains(line, "FUNC") && !strings.Contains(line, "UND") {
 					ndx := fields[6]
