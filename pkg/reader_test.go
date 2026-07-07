@@ -668,3 +668,28 @@ func TestEnumStringers(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteFixedRelocsRELPath exercises applyRelRelocs and the REL branch of
+// computeRelValue (AArch64 samples are RELA-only, so this path is otherwise
+// unexercised end to end).
+func TestWriteFixedRelocsRELPath(t *testing.T) {
+	data := make([]byte, 0x100)
+	binary.LittleEndian.PutUint64(data[0x40:], 0x1040) // RELATIVE slot: base+0x40
+	binary.LittleEndian.PutUint64(data[0x50:], 0x1050) // GLOB_DAT slot: base+0x50
+	r := testRebuilderWithBytes(t, data)
+	r.BaseAddr = 0x1000
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Filesz: 0x100, Memsz: 0x100}}
+	r.Rel = []Elf64_Rel{
+		{Offset: 0x40, Info: uint64(R_AARCH64_RELATIVE)},
+		{Offset: 0x50, Info: uint64(R_AARCH64_GLOB_DAT)},
+	}
+	if err := r.writeFixedRelocs(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.readUint64OutAt(0x40); got != 0x40 {
+		t.Fatalf("REL RELATIVE slot = 0x%x, want 0x40", got)
+	}
+	if got := r.readUint64OutAt(0x50); got != 0x50 {
+		t.Fatalf("REL GLOB_DAT slot = 0x%x, want 0x50", got)
+	}
+}

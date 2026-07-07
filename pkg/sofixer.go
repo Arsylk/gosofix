@@ -1,3 +1,9 @@
+// Package sofixer normalizes Android ARM64 (AArch64) ELF shared-object memory
+// dumps back into valid ELF files for static analysis. A dump captures the
+// post-relocation image at a runtime base address; sofixer reverses the dynamic
+// linker's fixups (relocations, GOT/PLT slots, init arrays) to base-independent
+// offsets, reconstructs section headers from the dynamic segment, and writes a
+// tool-loadable ELF. It targets ET_DYN AArch64 objects only.
 package sofixer
 
 import (

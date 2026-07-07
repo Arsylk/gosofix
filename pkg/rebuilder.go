@@ -8,6 +8,8 @@ import (
 	"sort"
 )
 
+// ElfRebuilder writes a normalized ELF from a parsed ElfReader, applying inverse
+// relocations and reconstructing section headers.
 type ElfRebuilder struct {
 	*ElfReader
 	OutFile   *os.File
@@ -19,6 +21,7 @@ type ElfRebuilder struct {
 	sectionNameLookup map[uint32]string
 }
 
+// NewElfRebuilder creates a rebuilder for reader that writes to outputPath.
 func NewElfRebuilder(reader *ElfReader, outputPath string) (*ElfRebuilder, error) {
 	rebuilder := ElfRebuilder{
 		ElfReader: reader,

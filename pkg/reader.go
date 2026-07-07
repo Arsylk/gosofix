@@ -10,6 +10,9 @@ import (
 	"github.com/charmbracelet/log"
 )
 
+// ElfReader parses an AArch64 ELF memory dump and holds the extracted headers,
+// dynamic metadata, symbols, and relocation tables (with dump addresses
+// normalized to module-relative offsets).
 type ElfReader struct {
 	File        *os.File
 	ElfHeader   *Elf64_Ehdr
@@ -100,6 +103,8 @@ type ElfReader struct {
 	BaseAddr uint64
 }
 
+// Read parses the ELF header, program headers, dynamic section, relocations,
+// and metadata in order. It is the reader entry point.
 func (r *ElfReader) Read() error {
 	// 1. Read and validate ELF header
 	if err := r.ReadElfHeader(); err != nil {
@@ -127,6 +132,7 @@ func (r *ElfReader) Read() error {
 	return nil
 }
 
+// ReadElfHeader reads and validates the ELF header and normalizes the entry point.
 func (r *ElfReader) ReadElfHeader() error {
 	r.logger.Debug("ehdr read")
 	if err := binary.Read(r.File, binary.LittleEndian, r.ElfHeader); err != nil {
@@ -168,6 +174,7 @@ func (r *ElfReader) ReadElfHeader() error {
 	return nil
 }
 
+// ReadPhdrs reads the program header table and normalizes segment addresses.
 func (r *ElfReader) ReadPhdrs() error {
 	phtSize := uint64(r.ElfHeader.Phnum) * uint64(r.ElfHeader.Phentsize)
 	if phtSize == 0 {
@@ -288,6 +295,7 @@ func (r *ElfReader) normalizeLoadedAddressValue(val uint64) uint64 {
 	return val
 }
 
+// ReadDyns reads the PT_DYNAMIC section and extracts the dynamic tags.
 func (r *ElfReader) ReadDyns() error {
 	var dynamicPhdr *Elf64_Phdr
 	for i := range r.Phdrs {
@@ -486,6 +494,7 @@ func (r *ElfReader) calculateVerneedSize() uint64 {
 	return totalSize
 }
 
+// ReadRelocs reads the symbol table and all relocation tables.
 func (r *ElfReader) ReadRelocs() error {
 	if err := r.readSymbols(); err != nil {
 		return err

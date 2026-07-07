@@ -119,6 +119,7 @@ const (
 	ehOffShstrndx  = 62 // e_shstrndx
 )
 
+// PT_Type is an ELF program-header segment type (p_type).
 type PT_Type uint32
 
 const (
@@ -133,6 +134,7 @@ const (
 	PT_GNU_RELRO    PT_Type = 0x6474e552
 )
 
+// PF_Flags is an ELF program-header permission bitmask (p_flags).
 type PF_Flags uint32
 
 const (
@@ -141,6 +143,7 @@ const (
 	PF_R PF_Flags = 4 // Read
 )
 
+// String returns the "PF_R|PF_W|PF_X" style permission text.
 func (f PF_Flags) String() string {
 	var s string
 	if (f & PF_R) != 0 {
@@ -164,6 +167,7 @@ func (f PF_Flags) String() string {
 	return s
 }
 
+// SHT_Type is an ELF section-header type (sh_type).
 type SHT_Type uint32
 
 const (
@@ -190,6 +194,7 @@ const (
 	SHT_ANDROID_RELR  SHT_Type = 0x6fffff00 // legacy Android experimental RELR section
 )
 
+// DT_Tag is an ELF dynamic-section entry tag (d_tag).
 type DT_Tag uint64
 
 const (
@@ -260,6 +265,7 @@ type Elf64_Verneed struct {
 	Next    uint32
 }
 
+// String returns the symbolic name of the segment type.
 func (p PT_Type) String() string {
 	switch p {
 	case PT_LOAD:
@@ -286,6 +292,7 @@ func (p PT_Type) String() string {
 	}
 }
 
+// String returns the symbolic name of the section type.
 func (t SHT_Type) String() string {
 	switch t {
 	case SHT_NULL:
@@ -335,6 +342,7 @@ func (t SHT_Type) String() string {
 	}
 }
 
+// String returns the symbolic name of the dynamic tag.
 func (t DT_Tag) String() string {
 	switch t {
 	case DT_NULL:
@@ -432,6 +440,7 @@ func (t DT_Tag) String() string {
 	}
 }
 
+// RelocationType is an AArch64 ELF relocation type (the low 32 bits of r_info).
 type RelocationType uint32
 
 const (
@@ -457,6 +466,7 @@ const (
 	R_AARCH64_JUMP26           RelocationType = 0x11C // 284
 )
 
+// String returns the symbolic name of the relocation type.
 func (r RelocationType) String() string {
 	switch r {
 	case R_AARCH64_NONE:
@@ -497,6 +507,7 @@ func (r RelocationType) String() string {
 	}
 }
 
+// SymbolBinding is an ELF symbol binding (the high nibble of st_info).
 type SymbolBinding uint8
 
 const (
@@ -505,6 +516,7 @@ const (
 	STB_WEAK   SymbolBinding = 2
 )
 
+// String returns the symbolic name of the symbol binding.
 func (b SymbolBinding) String() string {
 	switch b {
 	case STB_LOCAL:
@@ -519,6 +531,7 @@ func (b SymbolBinding) String() string {
 	}
 }
 
+// SymbolType is an ELF symbol type (the low nibble of st_info).
 type SymbolType uint8
 
 const (
@@ -531,6 +544,7 @@ const (
 	STT_TLS     SymbolType = 6
 )
 
+// String returns the symbolic name of the symbol type.
 func (t SymbolType) String() string {
 	switch t {
 	case STT_NOTYPE:
@@ -557,22 +571,27 @@ func (s Elf64_Sym) StBind() SymbolBinding {
 	return SymbolBinding(s.Info >> 4)
 }
 
+// StType returns the symbol type from st_info.
 func (s Elf64_Sym) StType() SymbolType {
 	return SymbolType(s.Info & 0xf)
 }
 
+// Type returns the relocation type from r_info.
 func (r Elf64_Rel) Type() RelocationType {
 	return RelocationType(r.Info & 0xffffffff)
 }
 
+// Sym returns the symbol index from r_info.
 func (r Elf64_Rel) Sym() uint32 {
 	return uint32(r.Info >> 32)
 }
 
+// Type returns the relocation type from r_info.
 func (r Elf64_Rela) Type() RelocationType {
 	return RelocationType(r.Info & 0xffffffff)
 }
 
+// Sym returns the symbol index from r_info.
 func (r Elf64_Rela) Sym() uint32 {
 	return uint32(r.Info >> 32)
 }
