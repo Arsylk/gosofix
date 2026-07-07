@@ -519,3 +519,152 @@ func TestDecodePackedRelaAPS2NonGrouped(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodePackedRelaAPA1 covers the APA1 RELA format: cumulative
+// (offset_delta, addend_delta) pairs, all R_AARCH64_RELATIVE.
+func TestDecodePackedRelaAPA1(t *testing.T) {
+	blob := []byte("APA1")
+	for _, v := range []int64{
+		2,           // pairs
+		0x100, 0x10, // pair 0: offset_delta, addend_delta
+		0x8, 0x20, // pair 1
+	} {
+		blob = appendTestSLEB(blob, v)
+	}
+	r, _ := testReaderForBlob(t, blob)
+	got, err := r.decodePackedRela(0, uint64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Elf64_Rela{
+		{Offset: 0x100, Info: uint64(R_AARCH64_RELATIVE), Addend: 0x10},
+		{Offset: 0x108, Info: uint64(R_AARCH64_RELATIVE), Addend: 0x30},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("decoded %d relocs, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reloc[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestDecodePackedRelAPR1 covers the APR1 REL format: an initial offset plus
+// run-length (count, delta) pairs, all R_AARCH64_RELATIVE.
+func TestDecodePackedRelAPR1(t *testing.T) {
+	blob := []byte("APR1")
+	for _, v := range []int64{
+		1,      // pairs
+		0x1000, // initial_offset
+		2, 8,   // pair: count, delta
+	} {
+		blob = appendTestSLEB(blob, v)
+	}
+	r, _ := testReaderForBlob(t, blob)
+	got, err := r.decodePackedRel(0, uint64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOffsets := []uint64{0x1000, 0x1008, 0x1010}
+	if len(got) != len(wantOffsets) {
+		t.Fatalf("decoded %d relocs, want %d", len(got), len(wantOffsets))
+	}
+	for i, off := range wantOffsets {
+		if got[i].Offset != off || got[i].Type() != R_AARCH64_RELATIVE {
+			t.Fatalf("rel[%d] = {off=0x%x type=%s}, want off=0x%x RELATIVE",
+				i, got[i].Offset, got[i].Type().String(), off)
+		}
+	}
+}
+
+// TestWriteFixedRelocsTLSDESCSecondSlot drives the full writeFixedRelocs path
+// for an R_AARCH64_TLSDESC entry and asserts both descriptor words (the resolver
+// pointer and its argument at +8) are normalized.
+func TestWriteFixedRelocsTLSDESCSecondSlot(t *testing.T) {
+	data := make([]byte, 0x100)
+	binary.LittleEndian.PutUint64(data[0x40:], 0x1040) // first word: base(0x1000)+0x40
+	binary.LittleEndian.PutUint64(data[0x48:], 0x1048) // second word: base+0x48
+	r := testRebuilderWithBytes(t, data)
+	r.BaseAddr = 0x1000
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Filesz: 0x100, Memsz: 0x100}}
+	r.Rela = []Elf64_Rela{{Offset: 0x40, Info: uint64(R_AARCH64_TLSDESC)}}
+
+	if err := r.writeFixedRelocs(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.readUint64OutAt(0x40); got != 0x40 {
+		t.Fatalf("TLSDESC first word = 0x%x, want 0x40", got)
+	}
+	if got := r.readUint64OutAt(0x48); got != 0x48 {
+		t.Fatalf("TLSDESC second word = 0x%x, want 0x48", got)
+	}
+}
+
+// TestResolveAddress covers the checker's symbol > section > segment resolution.
+func TestResolveAddress(t *testing.T) {
+	meta := &elfMetadata{
+		symbols:  []resolvedSymbol{{name: "foo", value: 0x2000, size: 0x40}},
+		shdrs:    []Elf64_Shdr{{}, {Addr: 0x3000, Size: 0x100, Name: 1}},
+		shstrtab: []byte{0, '.', 't', 'e', 'x', 't', 0},
+		phdrs:    []Elf64_Phdr{{Type: PT_LOAD, Flags: PF_R | PF_X, Vaddr: 0x1000, Memsz: 0x2000}},
+	}
+	cases := []struct {
+		addr uint64
+		want string
+	}{
+		{0x2000, "sym.foo"},               // exact symbol
+		{0x2010, "sym.foo+0x10"},          // inside symbol
+		{0x3050, "section[1]..text+0x50"}, // inside section (name is ".text")
+		{0x1500, "RX@0x1000+0x500"},       // segment fallback
+		{0x9999, ""},                      // nothing
+	}
+	for _, c := range cases {
+		if got := resolveAddress(meta, c.addr); got != c.want {
+			t.Errorf("resolveAddress(0x%x) = %q, want %q", c.addr, got, c.want)
+		}
+	}
+}
+
+// TestNormalizeRelOffsets covers the REL-table offset normalizer (the sample
+// corpus is RELA-only, so this path is otherwise unexercised).
+func TestNormalizeRelOffsets(t *testing.T) {
+	r := &ElfReader{
+		BaseAddr: 0x1000,
+		Phdrs:    []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Memsz: 0x100}},
+	}
+	list := []Elf64_Rel{{Offset: 0x1040}, {Offset: 0x40}}
+	r.normalizeRelOffsets(list)
+	if list[0].Offset != 0x40 {
+		t.Fatalf("rel[0].Offset = 0x%x, want 0x40 (normalized)", list[0].Offset)
+	}
+	if list[1].Offset != 0x40 {
+		t.Fatalf("rel[1].Offset = 0x%x, want 0x40 (out of range, unchanged)", list[1].Offset)
+	}
+}
+
+// TestEnumStringers covers every enum String() method, including the default
+// (unknown value) branch of each.
+func TestEnumStringers(t *testing.T) {
+	cases := []struct{ got, want string }{
+		{PF_Flags(0).String(), "0"},
+		{(PF_R | PF_W | PF_X).String(), "PF_R|PF_W|PF_X"},
+		{SHT_PROGBITS.String(), "SHT_PROGBITS"},
+		{SHT_Type(0x12345678).String(), "SHT_UNKNOWN(0x12345678)"},
+		{PT_LOAD.String(), "PT_LOAD"},
+		{PT_Type(0x99).String(), "UNKNOWN_PT_TYPE(0x99)"},
+		{DT_NULL.String(), "DT_NULL"},
+		{DT_Tag(0x12345).String(), "DT_UNKNOWN(0x12345)"},
+		{R_AARCH64_RELATIVE.String(), "R_AARCH64_RELATIVE"},
+		{RelocationType(0xffff).String(), "UNKNOWN_RELOC_TYPE(65535)"},
+		{STB_GLOBAL.String(), "STB_GLOBAL"},
+		{SymbolBinding(9).String(), "STB_UNKNOWN_BINDING(9)"},
+		{STT_FUNC.String(), "STT_FUNC"},
+		{SymbolType(9).String(), "STT_UNKNOWN(9)"},
+	}
+	for i, c := range cases {
+		if c.got != c.want {
+			t.Errorf("stringer case %d: got %q, want %q", i, c.got, c.want)
+		}
+	}
+}
