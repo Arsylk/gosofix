@@ -6,7 +6,7 @@ typedef char* (*FixElfFunc)(const char*, unsigned long long, const char*);
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <path_to_gosofix_so> <lib_to_fix>\n", argv[0]);
+        fprintf(stderr, "usage: %s <path_to_gosofix_so> <lib_to_fix> [output]\n", argv[0]);
         return 1;
     }
 
@@ -26,13 +26,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Calling FixElf via dlsym...\n");
-    char* msg = fix_elf(target_lib, 0, NULL);
+    const char* output = argc >= 4 ? argv[3] : NULL;
+    printf("calling FixElf via dlsym\n");
+    char* msg = fix_elf(target_lib, 0, output);
     if (msg) {
-        printf("Message from FixElf: %s\n", msg);
+        printf("FixElf result: %s\n", msg);
         free(msg); // Free the string returned by Go
     } else {
-        printf("FixElf returned a null message.\n");
+        printf("FixElf returned null\n");
     }
 
     dlclose(handle);

@@ -156,12 +156,16 @@ func (m *elfMetadata) readSymbols(file *os.File, sh Elf64_Shdr) ([]resolvedSymbo
 	}
 
 	var strtab []byte
-	if sh.Link != 0 && uint16(sh.Link) < m.ehdr.Shnum {
-		strsh := m.shdrs[sh.Link]
-		strtab = make([]byte, strsh.Size)
-		n, err := file.ReadAt(strtab, int64(strsh.Offset))
-		if err != nil || n != int(strsh.Size) {
-			issues = append(issues, fmt.Sprintf("strtab:read failed at 0x%x: read=%d size=%d err=%v", strsh.Offset, n, strsh.Size, err))
+	if sh.Link != 0 {
+		if sh.Link >= uint32(len(m.shdrs)) {
+			issues = append(issues, fmt.Sprintf("symbols:bad_link link=%d shnum=%d", sh.Link, len(m.shdrs)))
+		} else {
+			strsh := m.shdrs[sh.Link]
+			strtab = make([]byte, strsh.Size)
+			n, err := file.ReadAt(strtab, int64(strsh.Offset))
+			if err != nil || n != int(strsh.Size) {
+				issues = append(issues, fmt.Sprintf("strtab:read failed at 0x%x: read=%d size=%d err=%v", strsh.Offset, n, strsh.Size, err))
+			}
 		}
 	}
 

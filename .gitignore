@@ -1,4 +1,6 @@
-samples/*.so
+samples/*_fix.so
+samples/*_fix.so-*
+samples/*_fixed.so
 dist/
 build/
 .xmake

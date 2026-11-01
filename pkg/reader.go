@@ -82,7 +82,7 @@ type ElfReader struct {
 
 	// Versioning information
 	verneedVaddr uint64
-	verneedNum   uint16
+	verneedNum   uint32
 	verneedSize  uint64
 	versymVaddr  uint64
 
@@ -139,11 +139,6 @@ func (r *ElfReader) ReadElfHeader() error {
 		return fmt.Errorf("failed to read ELF header: %w", err)
 	}
 
-	// Normalize entry point if it appears absolute
-	if r.BaseAddr != 0 && r.ElfHeader.Entry >= r.BaseAddr {
-		r.ElfHeader.Entry -= r.BaseAddr
-	}
-
 	if r.ElfHeader.Magic != [4]byte{0x7f, 'E', 'L', 'F'} {
 		return fmt.Errorf("invalid ELF magic number: %x (expected 0x7f454c46)", r.ElfHeader.Magic)
 	}
@@ -168,6 +163,12 @@ func (r *ElfReader) ReadElfHeader() error {
 	}
 	if r.ElfHeader.Type != ET_DYN {
 		return fmt.Errorf("unsupported ELF type: %d (expected shared object/3)", r.ElfHeader.Type)
+	}
+
+	// Normalize only after the header has passed validation so a rejected input
+	// remains an exact representation of the bytes that were read.
+	if r.BaseAddr != 0 && r.ElfHeader.Entry >= r.BaseAddr {
+		r.ElfHeader.Entry -= r.BaseAddr
 	}
 	r.logger.Info("ehdr valid", "class", "64-bit", "arch", "aarch64", "type", "shared object", "entry_size", r.ElfHeader.Phentsize)
 
@@ -346,9 +347,11 @@ func (r *ElfReader) ReadDyns() error {
 
 	for i := range r.Dyns {
 		entry := &r.Dyns[i]
-		// DT_NULL terminates the dynamic array; anything past it is undefined
-		// (in dumps, often stale runtime data that can resemble real tags).
+		// Keep the terminator and discard stale runtime data after it. This makes
+		// later metadata resolution and serialization use the same valid prefix.
 		if entry.Tag == DT_NULL {
+			r.Dyns = r.Dyns[:i+1]
+			r.dynamicSize = uint64(len(r.Dyns)) * sizeofDyn
 			break
 		}
 		val := entry.Val
@@ -440,7 +443,11 @@ func (r *ElfReader) ReadDyns() error {
 		case DT_VERNEED:
 			r.verneedVaddr = val
 		case DT_VERNEEDNUM:
-			r.verneedNum = uint16(val)
+			const maxVerneedCount = 65_536
+			if val > maxVerneedCount {
+				return fmt.Errorf("DT_VERNEEDNUM:count_overflow count=%d max=%d", val, maxVerneedCount)
+			}
+			r.verneedNum = uint32(val)
 		case DT_VERSYM:
 			r.versymVaddr = val
 		}
@@ -462,7 +469,7 @@ func (r *ElfReader) calculateVerneedSize() uint64 {
 	}
 	fileSize := uint64(fileInfo.Size())
 
-	for i := uint16(0); i < r.verneedNum; i++ {
+	for i := uint32(0); i < r.verneedNum; i++ {
 		fileOffset := r.vaddrToOffset(offset)
 		if fileOffset+sizeofVerneed > fileSize {
 			r.logger.Warn("verneed bounds", "offset", fileOffset, "file_size", fileSize)
@@ -527,7 +534,11 @@ func relocationEntryCount(name string, tableSize uint64, entrySize uint64) (uint
 func (r *ElfReader) readSymbols() error {
 	var err error
 	if r.symCount, err = r.calculateSymbolCount(); err != nil {
-		return fmt.Errorf("sym:read: %w", err)
+		// A missing or corrupt hash table is not fatal for a memory dump.
+		// We can still rebuild the ELF structure (segments, sections, dynamic)
+		// even when symbols can't be recovered.
+		r.logger.Warn("sym count", "reason", err.Error())
+		r.symCount = 0
 	}
 
 	if r.symCount == 0 {
@@ -630,18 +641,22 @@ func (r *ElfReader) readRelocationTables() error {
 	}
 
 	if r.relrVaddr != 0 {
-		entrySize, err := fixedRelocationEntrySize("DT_RELR", r.relrEntrySize, sizeofPtr)
-		if err != nil {
-			return err
-		}
-		count, err := relocationEntryCount("DT_RELR", r.relrSize, entrySize)
-		if err != nil {
-			return err
-		}
-		fileOffset := r.vaddrToOffset(r.relrVaddr)
-		r.logger.Info("relr read", "vaddr", r.relrVaddr, "count", count)
-		if r.Relr, err = readArray[uint64](r.File, fileOffset, count, "DT_RELR"); err != nil {
-			return err
+		if r.relrSize == 0 {
+			r.logger.Warn("relr missing size", "detail", "DT_RELR present without DT_RELRSZ")
+		} else {
+			entrySize, err := fixedRelocationEntrySize("DT_RELR", r.relrEntrySize, sizeofPtr)
+			if err != nil {
+				return err
+			}
+			count, err := relocationEntryCount("DT_RELR", r.relrSize, entrySize)
+			if err != nil {
+				return err
+			}
+			fileOffset := r.vaddrToOffset(r.relrVaddr)
+			r.logger.Info("relr read", "vaddr", r.relrVaddr, "count", count)
+			if r.Relr, err = readArray[uint64](r.File, fileOffset, count, "DT_RELR"); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -679,9 +694,12 @@ func (r *ElfReader) readRelocationTables() error {
 	return nil
 }
 
-// maxSymbolChainWalk caps the GNU-hash chain walk so a corrupt/looping chain
-// can't spin indefinitely. It is a sanity bound, not a spec limit.
-const maxSymbolChainWalk = 1_000_000
+// Symbol-table recovery is bounded independently from the file-size check so
+// corrupt hash metadata cannot drive excessive work or allocations.
+const (
+	maxSymbolChainWalk = 1_000_000
+	maxSymbolCount     = 1_000_000
+)
 
 // calculateSymbolCount determines the total number of symbols using hash tables
 func (r *ElfReader) calculateSymbolCount() (uint64, error) {
@@ -697,6 +715,9 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 			return 0, fmt.Errorf("hash:read: %w", err)
 		}
 
+		if header.Nchain > maxSymbolCount {
+			return 0, fmt.Errorf("hash:symcount_overflow count=%d max=%d", header.Nchain, maxSymbolCount)
+		}
 		return uint64(header.Nchain), nil
 	}
 
@@ -800,9 +821,16 @@ func (r *ElfReader) calculateSymbolCount() (uint64, error) {
 		}
 
 		if !seenChain {
+			if header.Symndx > maxSymbolCount {
+				return 0, fmt.Errorf("gnu_hash:symcount_overflow count=%d max=%d", header.Symndx, maxSymbolCount)
+			}
 			return uint64(header.Symndx), nil
 		}
-		return maxSymIdx + 1, nil
+		count := maxSymIdx + 1
+		if count > maxSymbolCount {
+			return 0, fmt.Errorf("gnu_hash:symcount_overflow count=%d max=%d", count, maxSymbolCount)
+		}
+		return count, nil
 	}
 
 	return 0, fmt.Errorf("sym:count | missing DT_HASH or DT_GNU_HASH")
@@ -952,11 +980,12 @@ func (r *ElfReader) readStrtabString(nameOffset uint32) string {
 		return ""
 	}
 
-	// Bound the read to strtabSize (or 64 KiB) to guard against missing NULs
-	// in corrupted strtab data.
+	// Bound the read to strtabSize (or 1 MiB when DT_STRSZ is absent) to guard
+	// against missing NULs in corrupted strtab data. Obfuscated payloads with
+	// large merged strtabs can legitimately exceed 64 KiB.
 	maxLen := r.strtabSize
-	if maxLen == 0 || maxLen > 65536 {
-		maxLen = 65536
+	if maxLen == 0 || maxLen > 1<<20 {
+		maxLen = 1 << 20
 	}
 	remaining := fileSize - fileOffset
 	if maxLen > remaining {

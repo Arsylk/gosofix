@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
+	"github.com/muesli/termenv"
 )
 
 // styles is built once and shared across all loggers. log.Styles values are
@@ -70,6 +72,13 @@ func newLogger(verbosity int) (*log.Logger, error) {
 		return nil, fmt.Errorf("invalid verbosity %d (expected 0, 1, or 2)", verbosity)
 	}
 	lg := log.NewWithOptions(os.Stdout, log.Options{ReportTimestamp: false, ReportCaller: false})
+	// Forced color must retain our RGB palette when output is captured by a
+	// host tool. termenv otherwise falls back to 16-color ANSI on pipes.
+	if _, disabled := os.LookupEnv("NO_COLOR"); disabled {
+		lg.SetColorProfile(termenv.Ascii)
+	} else if forced := os.Getenv("CLICOLOR_FORCE"); forced != "" && forced != "0" {
+		lg.SetColorProfile(termenv.TrueColor)
+	}
 	lg.SetStyles(styles())
 	lg.SetLevel(level)
 	return lg, nil
@@ -87,9 +96,20 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 	if err != nil {
 		return nil, err
 	}
+	if outputPath == "" {
+		return nil, fmt.Errorf("missing output file")
+	}
 	lg.Info("elf fix", "path", filePath, "base", baseAddr)
 
-	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
+	same, err := pathsReferToSameFile(filePath, outputPath)
+	if err != nil {
+		return nil, err
+	}
+	if same {
+		return nil, fmt.Errorf("input and output refer to the same file")
+	}
+
+	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
@@ -101,36 +121,65 @@ func FixELFHeaders(filePath string, baseAddr uint64, outputPath string, verbosit
 		BaseAddr:  baseAddr,
 		logger:    lg,
 	}
-
 	if err := reader.Read(); err != nil {
 		return nil, err
 	}
 
-	rebuilder, err := NewElfRebuilder(&reader, outputPath)
+	temp, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary output: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close temporary output: %w", err)
+	}
+	if err := os.Chmod(tempPath, 0o644); err != nil {
+		return nil, fmt.Errorf("failed to set output mode: %w", err)
+	}
+
+	rebuilder, err := NewElfRebuilder(&reader, tempPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rebuilder: %w", err)
 	}
-	defer rebuilder.OutFile.Close()
-
 	if err := rebuilder.WriteFixedElf(); err != nil {
+		rebuilder.OutFile.Close()
 		lg.Error("elf fin", "error", err, "output_path", outputPath)
 		return nil, err
 	}
-
-	// Close the writer side before re-opening for verification so the writes
-	// are durably visible. Re-closing on the defer is harmless.
 	if err := rebuilder.OutFile.Close(); err != nil {
 		return nil, fmt.Errorf("failed to close output: %w", err)
 	}
 
-	// Post-fix verification on the closed output file
-	var issues []string
-	if _, statErr := os.Stat(outputPath); statErr == nil {
-		issues = CheckFixedElf(lg, outputPath, baseAddr)
+	issues := CheckFixedElf(lg, tempPath, baseAddr)
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		return nil, fmt.Errorf("failed to install output: %w", err)
 	}
 
 	lg.Info("elf fin", "output_path", outputPath)
 	return issues, nil
+}
+
+func pathsReferToSameFile(inputPath, outputPath string) (bool, error) {
+	inputInfo, err := os.Stat(inputPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat input: %w", err)
+	}
+	if outputInfo, err := os.Stat(outputPath); err == nil {
+		return os.SameFile(inputInfo, outputInfo), nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to stat output: %w", err)
+	}
+
+	inputAbs, err := filepath.Abs(inputPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve input path: %w", err)
+	}
+	outputAbs, err := filepath.Abs(outputPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve output path: %w", err)
+	}
+	return filepath.Clean(inputAbs) == filepath.Clean(outputAbs), nil
 }
 
 // readArray reads exactly 'count' elements of type T from file at the given

@@ -155,6 +155,44 @@ func TestFixELFHeaders_ErrorPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("same input and output", func(t *testing.T) {
+		path := writeTempELF(t, validElfHeader())
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = sofixer.FixELFHeaders(path, 0x1000, path, 0)
+		if err == nil || !strings.Contains(err.Error(), "same file") {
+			t.Fatalf("expected same-file error, got: %v", err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("same-file rejection modified input")
+		}
+	})
+
+	t.Run("failed rebuild preserves output", func(t *testing.T) {
+		path := writeTempELF(t, validElfHeader())
+		const sentinel = "existing output"
+		if err := os.WriteFile(out, []byte(sentinel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := sofixer.FixELFHeaders(path, 0x1000, out, 0)
+		if err == nil {
+			t.Fatal("expected rebuild error")
+		}
+		got, readErr := os.ReadFile(out)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(got) != sentinel {
+			t.Fatalf("failed rebuild replaced output with %q", got)
+		}
+	})
+
 	t.Run("invalid verbosity", func(t *testing.T) {
 		_, err := sofixer.FixELFHeaders("/dev/null", 0x1000, out, 99)
 		if err == nil || !strings.Contains(err.Error(), "invalid verbosity") {
@@ -266,15 +304,8 @@ func testFixAndVerify(t *testing.T, inputPath string, baseAddr uint64, label str
 		t.Fatalf("[%s] FixELFHeaders failed: %v", label, err)
 	}
 	t.Logf("[%s] output=%s", label, outputPath)
-	// Residual-pointer diagnostics are heuristic and non-fatal by design (cmd
-	// treats them as warnings). Any other verifier issue is a structural defect
-	// in the rebuilt ELF and must fail the test.
 	for _, iss := range issues {
-		if strings.HasPrefix(iss, "residual_addrs") {
-			t.Logf("[%s] verifier (non-fatal): %s", label, iss)
-			continue
-		}
-		t.Errorf("[%s] verifier flagged structural issue: %s", label, iss)
+		t.Errorf("[%s] verifier flagged issue: %s", label, iss)
 	}
 	info, err := os.Stat(outputPath)
 	if err != nil || info.Size() == 0 {
@@ -302,6 +333,11 @@ func TestSampleDumps(t *testing.T) {
 		{"libriskdetector.so_dump_0x6f3d8f4000.so", 0x6f3d8f4000, "riskdetector"},
 		{"libhunter.so_dump_0x6bfda14000.so", 0x6bfda14000, "hunter"},
 		{"libuseard.so_dump_0x71fcfa8000.so", 0x71fcfa8000, "useard"},
+		{"libhjqqi.so_dump_0x76d8733000.so", 0x76d8733000, "hjqqi"},
+		{"libqvjgup_0x76eb6d9000.so", 0x76eb6d9000, "qvjgup"},
+		{"libwcyrugw.so_dump_0x76d8714000.so", 0x76d8714000, "wcyrugw"},
+		{"libso_pdr_0x6ce858f000.so", 0x6ce858f000, "so_pdr"},
+		{"libbhiak_0x6c18908000.so.BAK", 0x6c18908000, "bhiak"},
 	}
 
 	for _, s := range samples {

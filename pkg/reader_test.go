@@ -1,6 +1,7 @@
 package sofixer
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -218,6 +219,44 @@ func TestPointerArrayCountRejectsMisalignedSize(t *testing.T) {
 	}
 }
 
+func TestReadDynsTruncatesAtNull(t *testing.T) {
+	var blob bytes.Buffer
+	dyns := []Elf64_Dyn{
+		{Tag: DT_STRTAB, Val: 0x1234},
+		{Tag: DT_NULL},
+		{Tag: DT_NEEDED, Val: 7},
+	}
+	if err := binary.Write(&blob, binary.LittleEndian, dyns); err != nil {
+		t.Fatal(err)
+	}
+
+	r, _ := testReaderForBlob(t, blob.Bytes())
+	r.Phdrs = []Elf64_Phdr{{Type: PT_DYNAMIC, Offset: 0, Vaddr: 0x100, Memsz: uint64(blob.Len())}}
+	if err := r.ReadDyns(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Dyns) != 2 || r.Dyns[1].Tag != DT_NULL {
+		t.Fatalf("dynamic entries = %v, want valid prefix through DT_NULL", r.Dyns)
+	}
+	if r.dynamicSize != 2*sizeofDyn {
+		t.Fatalf("dynamic size = %d, want %d", r.dynamicSize, 2*sizeofDyn)
+	}
+}
+
+func TestReadRelocationTablesWarnsOnMissingRelrSize(t *testing.T) {
+	var logs bytes.Buffer
+	r, _ := testReaderForBlob(t, make([]byte, 16))
+	r.logger = log.NewWithOptions(&logs, log.Options{})
+	r.logger.SetLevel(log.WarnLevel)
+	r.relrVaddr = 8
+	if err := r.readRelocationTables(); err != nil {
+		t.Fatalf("missing RELR size returned error: %v", err)
+	}
+	if !strings.Contains(logs.String(), "relr missing size") {
+		t.Fatalf("missing RELR size warning not emitted: %q", logs.String())
+	}
+}
+
 func TestReadElfMetadataReportsBadSymbolSectionSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad-symbol-size.so")
 	f, err := os.Create(path)
@@ -276,6 +315,72 @@ func containsIssue(issues []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestReadElfMetadataReportsBadSymbolLink(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad-symbol-link.so")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ehdr := Elf64_Ehdr{
+		Magic: [4]byte{0x7f, 'E', 'L', 'F'}, Class: ELFCLASS64, Data: ELFDATA2LSB,
+		IdentVersion: 1, Type: ET_DYN, Machine: EM_AARCH64, Version: 1,
+		Ehsize: sizeofEhdr, ShdrOffset: sizeofEhdr, Shentsize: sizeofShdr, Shnum: 2,
+	}
+	shdrs := []Elf64_Shdr{{}, {
+		Type: SHT_DYNSYM, Offset: uint64(sizeofEhdr + 2*sizeofShdr),
+		Size: sizeofSym, Entsize: sizeofSym, Link: 0x10000,
+	}}
+	if err := binary.Write(f, binary.LittleEndian, &ehdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, shdrs); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(f, binary.LittleEndian, Elf64_Sym{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	in, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	_, issues := readElfMetadata(log.NewWithOptions(io.Discard, log.Options{}), in)
+	if !containsIssue(issues, "symbols:bad_link") {
+		t.Fatalf("expected symbols:bad_link issue, got %v", issues)
+	}
+}
+
+func TestComputeRelaRelativeNormalizesAbsoluteAddend(t *testing.T) {
+	const base = uint64(0x7000000000)
+	r := testRebuilderWithBytes(t, make([]byte, 8))
+	r.BaseAddr = base
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Memsz: 0x1000}}
+	rela := Elf64_Rela{Info: uint64(R_AARCH64_RELATIVE), Addend: int64(base + 0x420)}
+	if got := r.computeRelaValue(&rela, 0); got != 0x420 {
+		t.Fatalf("computeRelaValue(RELATIVE) = 0x%x, want 0x420", got)
+	}
+}
+
+func TestSynthesizeLoadGapSectionsKeepsFragmentedText(t *testing.T) {
+	r := testRebuilderWithBytes(t, make([]byte, 0x1000))
+	r.ElfHeader = &Elf64_Ehdr{}
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Flags: PF_X, Vaddr: 0, Memsz: 0x1000}}
+	known := []sectionInfo{{name: ".meta", addr: 0x200, size: 0x100}, {name: ".meta2", addr: 0x600, size: 0x100}}
+	sections := r.synthesizeLoadGapSections(known)
+	if len(sections) != 3 {
+		t.Fatalf("coverage sections = %d, want 3", len(sections))
+	}
+	for i, want := range []interval{{0, 0x200}, {0x300, 0x600}, {0x700, 0x1000}} {
+		if sections[i].addr != want.start || sections[i].size != want.end-want.start {
+			t.Fatalf("section %d = {addr=0x%x size=0x%x}, want {addr=0x%x size=0x%x}", i, sections[i].addr, sections[i].size, want.start, want.end-want.start)
+		}
+	}
 }
 
 func TestComputeRelaPREL64PreservesRuntimeSlot(t *testing.T) {
@@ -691,5 +796,75 @@ func TestWriteFixedRelocsRELPath(t *testing.T) {
 	}
 	if got := r.readUint64OutAt(0x50); got != 0x50 {
 		t.Fatalf("REL GLOB_DAT slot = 0x%x, want 0x50", got)
+	}
+}
+
+// TestWriteSymbolTableRejectsOutOfLoadSymtab covers the case where an
+// obfuscated DT_SYMTAB points outside every PT_LOAD segment. The old code
+// silently fell back to writing at the raw vaddr, extending the output file
+// with garbage. The fixed code returns a hard error instead.
+func TestWriteSymbolTableRejectsOutOfLoadSymtab(t *testing.T) {
+	r := testRebuilderWithBytes(t, make([]byte, 0x100))
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Memsz: 0x100}}
+	r.symtabVaddr = 0x99999 // outside PT_LOAD
+	r.Symbols = []Elf64_Sym{{Name: 1}}
+
+	err := r.writeSymbolTable()
+	if err == nil || !strings.Contains(err.Error(), "not in any PT_LOAD") {
+		t.Fatalf("expected PT_LOAD rejection, got %v", err)
+	}
+}
+
+// TestWriteRelocationTablesRejectsOutOfLoadRel covers the same vaddrToOffset
+// fallback bug in writeRelocationTables: a DT_REL pointing outside PT_LOAD
+// must produce an error, not a silent file-extension write.
+func TestWriteRelocationTablesRejectsOutOfLoadRel(t *testing.T) {
+	r := testRebuilderWithBytes(t, make([]byte, 0x100))
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Memsz: 0x100}}
+	r.relVaddr = 0x99999
+	r.Rel = []Elf64_Rel{{Offset: 0x30}}
+
+	err := r.writeRelocationTables()
+	if err == nil || !strings.Contains(err.Error(), "not in any PT_LOAD") {
+		t.Fatalf("expected PT_LOAD rejection, got %v", err)
+	}
+}
+
+// TestWriteDynamicSectionRejectsOutOfLoad covers the same fallback bug in
+// writeDynamicSection.
+func TestWriteDynamicSectionRejectsOutOfLoad(t *testing.T) {
+	r := testRebuilderWithBytes(t, make([]byte, 0x100))
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Memsz: 0x100}}
+	r.dynamicVaddr = 0x99999
+	r.Dyns = []Elf64_Dyn{{Tag: DT_NULL}}
+
+	err := r.writeDynamicSection()
+	if err == nil || !strings.Contains(err.Error(), "not in any PT_LOAD") {
+		t.Fatalf("expected PT_LOAD rejection, got %v", err)
+	}
+}
+
+// TestNormalizePointerArraySkipsOutOfLoadSlots verifies that individual
+// init_array slots whose vaddr is outside PT_LOAD are skipped with a warning
+// rather than silently extended into the output file.
+func TestNormalizePointerArraySkipsOutOfLoadSlots(t *testing.T) {
+	data := make([]byte, 0x100)
+	binary.LittleEndian.PutUint64(data[0xF0:], 0x1040) // in-range slot at vaddr 0xF0
+	binary.LittleEndian.PutUint64(data[0xF8:], 0x1048) // in-range slot at vaddr 0xF8
+	r := testRebuilderWithBytes(t, data)
+	r.BaseAddr = 0x1000
+	r.Phdrs = []Elf64_Phdr{{Type: PT_LOAD, Vaddr: 0, Offset: 0, Memsz: 0x100}}
+
+	// Four slots starting at vaddr 0xF0: 0xF0 and 0xF8 are in PT_LOAD,
+	// 0x100 and 0x108 are outside (vaddr >= Vaddr+Memsz).
+	err := r.normalizePointerArray("init_array", 0xF0, 32)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got := r.readUint64OutAt(0xF0); got != 0x40 {
+		t.Fatalf("slot[0] = 0x%x, want 0x40 (normalized)", got)
+	}
+	if got := r.readUint64OutAt(0xF8); got != 0x48 {
+		t.Fatalf("slot[1] = 0x%x, want 0x48 (normalized)", got)
 	}
 }

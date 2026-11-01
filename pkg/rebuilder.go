@@ -43,26 +43,11 @@ func NewElfRebuilder(reader *ElfReader, outputPath string) (*ElfRebuilder, error
 
 // WriteFixedElf copies the source file and writes fixed relocation values
 func (r *ElfRebuilder) WriteFixedElf() error {
-	// Calculate total file size from loaded segments (max Vaddr - min Vaddr)
-	var minVaddr uint64 = ^uint64(0)
-	var maxVaddr uint64 = 0
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD {
-			if phdr.Vaddr < minVaddr {
-				minVaddr = phdr.Vaddr
-			}
-			if phdr.Vaddr+phdr.Memsz > maxVaddr {
-				maxVaddr = phdr.Vaddr + phdr.Memsz
-			}
-		}
-	}
-	if minVaddr != ^uint64(0) {
-		r.TotalSize = maxVaddr - minVaddr
-	}
-
-	if err := r.rebuildFileLayout(); err != nil {
+	totalSize, err := r.rebuildFileLayout()
+	if err != nil {
 		return fmt.Errorf("failed to rebuild file layout: %w", err)
 	}
+	r.TotalSize = totalSize
 
 	// Fix ELF Header - write normalized Entry address.
 	if err := r.writeAtOffset(ehOffEntry, r.ElfHeader.Entry); err != nil {
@@ -208,9 +193,8 @@ func (r *ElfRebuilder) pltRelocSection() (string, SHT_Type) {
 }
 
 // synthesizeLoadGapSections emits PROGBITS coverage sections (.text/.rw/.ro) for
-// the parts of each PT_LOAD segment not already claimed by a known metadata
-// section, so analysis tools see the whole image. Executable segments emit only
-// their single largest gap as .text to avoid overlay conflicts.
+// every part of each PT_LOAD segment not already claimed by known metadata, so
+// fragmented executable ranges remain visible to analysis tools.
 func (r *ElfRebuilder) synthesizeLoadGapSections(knownSections []sectionInfo) []sectionInfo {
 	loadSectionName := func(phdr Elf64_Phdr) string {
 		if (phdr.Flags & PF_X) != 0 {
@@ -298,16 +282,6 @@ func (r *ElfRebuilder) synthesizeLoadGapSections(knownSections []sectionInfo) []
 			gaps = append(gaps, interval{curr, phdr.Vaddr + phdr.Memsz})
 		}
 
-		largestGapIdx := -1
-		var largestGapSize uint64
-		for i, gap := range gaps {
-			size := gap.end - gap.start
-			if size > largestGapSize {
-				largestGapSize = size
-				largestGapIdx = i
-			}
-		}
-
 		base := loadSectionName(phdr)
 		segIdx := nameOccurrence[base]
 		nameOccurrence[base]++
@@ -322,14 +296,8 @@ func (r *ElfRebuilder) synthesizeLoadGapSections(knownSections []sectionInfo) []
 			if size == 0 {
 				continue
 			}
-			// For executable segments, only emit the largest gap as a single .text section.
-			// Smaller gaps (between metadata sections) are skipped to prevent Ghidra from
-			// creating .text as an overlay when gap addresses conflict with metadata sections.
-			if (phdr.Flags&PF_X) != 0 && i != largestGapIdx {
-				continue
-			}
 			name := base + segSuffix
-			if i != largestGapIdx {
+			if i > 0 {
 				name = fmt.Sprintf("%s.%d", name, i)
 			}
 			out = append(out, sectionInfo{
@@ -517,6 +485,12 @@ func (r *ElfRebuilder) writeSectionHeaders() error {
 	r.addSectionName(".shstrtab")
 	shstrtabIdx := r.addSection(".shstrtab", SHT_STRTAB, 0, 0, uint64(len(r.shstrtab)), 0, 0, 0)
 
+	// e_shnum is uint16; SHN_LORESERVE (0xff00) is the first reserved value.
+	// Guard before any section data is written to the output file.
+	if len(r.sections) >= 0xff00 {
+		return fmt.Errorf("section count %d exceeds ELF limit %d", len(r.sections), 0xff00)
+	}
+
 	// Calculate where to write (end of file)
 	fileInfo, err := r.OutFile.Stat()
 	if err != nil {
@@ -624,7 +598,12 @@ func (r *ElfRebuilder) normalizePointerArray(name string, vaddr, size uint64) er
 		return err
 	}
 	for i := range count {
-		fileOffset := r.vaddrToOffset(vaddr + i*sizeofPtr)
+		slotVaddr := vaddr + i*sizeofPtr
+		fileOffset, ok := r.vaddrToFileOffset(slotVaddr)
+		if !ok {
+			r.logger.Warn(name+" skip", "index", i, "vaddr", slotVaddr, "reason", "not in pt_load")
+			continue
+		}
 		value := r.readUint64OutAt(fileOffset)
 		newVal := r.normalizeLoadedAddressValue(value)
 		if newVal != value {
@@ -848,8 +827,10 @@ func (r *ElfRebuilder) writeSymbolTable() error {
 		return nil
 	}
 
-	symtabFileOffset := r.vaddrToOffset(r.symtabVaddr)
-	// Write the entire symbol table back to the file
+	symtabFileOffset, ok := r.vaddrToFileOffset(r.symtabVaddr)
+	if !ok {
+		return fmt.Errorf("symtab vaddr 0x%x not in any PT_LOAD", r.symtabVaddr)
+	}
 	if err := r.writeAtOffset(symtabFileOffset, r.Symbols); err != nil {
 		return fmt.Errorf("failed to write symbol table: %w", err)
 	}
@@ -862,30 +843,45 @@ func (r *ElfRebuilder) writeSymbolTable() error {
 // The relocation target slots are fixed separately by writeFixedRelocs.
 func (r *ElfRebuilder) writeRelocationTables() error {
 	if r.relVaddr != 0 && len(r.Rel) > 0 {
-		if err := r.writeAtOffset(r.vaddrToOffset(r.relVaddr), r.Rel); err != nil {
+		off, ok := r.vaddrToFileOffset(r.relVaddr)
+		if !ok {
+			return fmt.Errorf("DT_REL vaddr 0x%x not in any PT_LOAD", r.relVaddr)
+		}
+		if err := r.writeAtOffset(off, r.Rel); err != nil {
 			return fmt.Errorf("failed to write DT_REL table: %w", err)
 		}
 		r.logger.Info("rel table write", "count", len(r.Rel))
 	}
 
 	if r.relaVaddr != 0 && len(r.Rela) > 0 {
-		if err := r.writeAtOffset(r.vaddrToOffset(r.relaVaddr), r.Rela); err != nil {
+		off, ok := r.vaddrToFileOffset(r.relaVaddr)
+		if !ok {
+			return fmt.Errorf("DT_RELA vaddr 0x%x not in any PT_LOAD", r.relaVaddr)
+		}
+		if err := r.writeAtOffset(off, r.Rela); err != nil {
 			return fmt.Errorf("failed to write DT_RELA table: %w", err)
 		}
 		r.logger.Info("rela table write", "count", len(r.Rela))
 	}
 
 	if r.jmprelVaddr != 0 {
+		jmpOff, jmpOk := r.vaddrToFileOffset(r.jmprelVaddr)
 		switch {
 		case len(r.JmpRel) > 0 && len(r.JmpRela) > 0:
 			return fmt.Errorf("DT_JMPREL has both REL and RELA decoded tables")
 		case len(r.JmpRel) > 0:
-			if err := r.writeAtOffset(r.vaddrToOffset(r.jmprelVaddr), r.JmpRel); err != nil {
+			if !jmpOk {
+				return fmt.Errorf("DT_JMPREL vaddr 0x%x not in any PT_LOAD", r.jmprelVaddr)
+			}
+			if err := r.writeAtOffset(jmpOff, r.JmpRel); err != nil {
 				return fmt.Errorf("failed to write DT_JMPREL REL table: %w", err)
 			}
 			r.logger.Info("jmprel table write", "count", len(r.JmpRel), "type", "rel")
 		case len(r.JmpRela) > 0:
-			if err := r.writeAtOffset(r.vaddrToOffset(r.jmprelVaddr), r.JmpRela); err != nil {
+			if !jmpOk {
+				return fmt.Errorf("DT_JMPREL vaddr 0x%x not in any PT_LOAD", r.jmprelVaddr)
+			}
+			if err := r.writeAtOffset(jmpOff, r.JmpRela); err != nil {
 				return fmt.Errorf("failed to write DT_JMPREL RELA table: %w", err)
 			}
 			r.logger.Info("jmprel table write", "count", len(r.JmpRela), "type", "rela")
@@ -901,7 +897,11 @@ func (r *ElfRebuilder) writeRelocationTables() error {
 				}
 			}
 		}
-		if err := r.writeAtOffset(r.vaddrToOffset(r.relrVaddr), normalized); err != nil {
+		relrOff, relrOk := r.vaddrToFileOffset(r.relrVaddr)
+		if !relrOk {
+			return fmt.Errorf("DT_RELR vaddr 0x%x not in any PT_LOAD", r.relrVaddr)
+		}
+		if err := r.writeAtOffset(relrOff, normalized); err != nil {
 			return fmt.Errorf("failed to write DT_RELR table: %w", err)
 		}
 		r.Relr = normalized
@@ -917,8 +917,10 @@ func (r *ElfRebuilder) writeDynamicSection() error {
 		return nil
 	}
 
-	dynamicFileOffset := r.vaddrToOffset(r.dynamicVaddr)
-	// Write the entire dynamic section back to the file
+	dynamicFileOffset, ok := r.vaddrToFileOffset(r.dynamicVaddr)
+	if !ok {
+		return fmt.Errorf("dynamic vaddr 0x%x not in any PT_LOAD", r.dynamicVaddr)
+	}
 	if err := r.writeAtOffset(dynamicFileOffset, r.Dyns); err != nil {
 		return fmt.Errorf("failed to write dynamic section: %w", err)
 	}
@@ -1030,8 +1032,9 @@ func (r *ElfRebuilder) computeRelaValue(rela *Elf64_Rela, fileOffset uint64) uin
 	}
 	switch relocType {
 	case R_AARCH64_RELATIVE:
-		// Result = B + A. With B normalised to 0 the value is simply A.
-		return uint64(A)
+		// Valid addends are already module-relative. Some protected dumps store
+		// runtime-absolute addends; normalize those only when they land in PT_LOAD.
+		return r.normalizeLoadedAddressValue(uint64(A))
 	default:
 		// Best-effort: if symbol is unresolved, preserve the in-memory pointer.
 		if S == 0 {
@@ -1068,49 +1071,53 @@ func (r *ElfRebuilder) relocationTargetOffset(vaddr uint64) (uint64, error) {
 	return fileOffset, nil
 }
 
-// rebuildFileLayout moves segments to match their virtual addresses in the output file
-func (r *ElfRebuilder) rebuildFileLayout() error {
-	// Find min and max Vaddr
-	var minVaddr uint64 = ^uint64(0)
-	var maxVaddr uint64 = 0
-	for _, phdr := range r.Phdrs {
-		if phdr.Type == PT_LOAD {
-			if phdr.Vaddr < minVaddr {
-				minVaddr = phdr.Vaddr
-			}
-			if phdr.Vaddr+phdr.Memsz > maxVaddr {
-				maxVaddr = phdr.Vaddr + phdr.Memsz
-			}
+// rebuildFileLayout validates and copies PT_LOAD segments to normalized offsets.
+func (r *ElfRebuilder) rebuildFileLayout() (uint64, error) {
+	info, err := r.File.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat input: %w", err)
+	}
+	fileSize := uint64(info.Size())
+	minVaddr := ^uint64(0)
+	var maxVaddr uint64
+	for i, phdr := range r.Phdrs {
+		if phdr.Type != PT_LOAD || phdr.Memsz == 0 {
+			continue
 		}
+		end := phdr.Vaddr + phdr.Memsz
+		if end < phdr.Vaddr {
+			return 0, fmt.Errorf("phdr %d virtual range overflows", i)
+		}
+		if phdr.Offset > fileSize || phdr.Memsz > fileSize-phdr.Offset {
+			return 0, fmt.Errorf("phdr %d source range exceeds dump: offset=%d size=%d file_size=%d", i, phdr.Offset, phdr.Memsz, fileSize)
+		}
+		minVaddr = min(minVaddr, phdr.Vaddr)
+		maxVaddr = max(maxVaddr, end)
 	}
 	if minVaddr == ^uint64(0) {
-		minVaddr = 0
+		return 0, fmt.Errorf("no loadable segments")
+	}
+	totalSize := maxVaddr - minVaddr
+	if totalSize > fileSize {
+		return 0, fmt.Errorf("loadable image exceeds continuous dump: size=%d file_size=%d", totalSize, fileSize)
 	}
 
-	// Copy segments one by one to handle potential gaps and .bss correctly.
-	// Memory dumps may not have data for all virtual address ranges.
 	for i := range r.Phdrs {
 		p := &r.Phdrs[i]
-		if p.Type != PT_LOAD {
+		if p.Type != PT_LOAD || p.Memsz == 0 {
 			continue
 		}
 
-		// Calculate output offset relative to minVaddr
-		outOffset := p.Vaddr - minVaddr
-
-		// Write full memory state (p_memsz)
-		// This captures .bss and any in-memory modifications
-		if p.Memsz > 0 {
-			segmentData := make([]byte, p.Memsz)
-			readN, err := r.File.ReadAt(segmentData, int64(p.Offset))
-			if err != nil {
-				r.logger.Warn("relayout read_partial", "index", i, "offset", p.Offset, "memory_size", p.Memsz, "read_count", readN, "error", err)
-			}
-			if _, err := r.OutFile.WriteAt(segmentData, int64(outOffset)); err != nil {
-				return fmt.Errorf("failed to write segment %d data: %w", i, err)
-			}
-			r.logger.Debug("segment relayout", "index", i, "vaddr", p.Vaddr, "size", p.Memsz, "offset", p.Offset)
+		segmentData := make([]byte, p.Memsz)
+		readN, err := r.File.ReadAt(segmentData, int64(p.Offset))
+		if err != nil || readN != len(segmentData) {
+			return 0, fmt.Errorf("segment %d truncated at 0x%x: read=%d expected=%d: %w", i, p.Offset, readN, len(segmentData), err)
 		}
+		outOffset := p.Vaddr - minVaddr
+		if _, err := r.OutFile.WriteAt(segmentData, int64(outOffset)); err != nil {
+			return 0, fmt.Errorf("failed to write segment %d data: %w", i, err)
+		}
+		r.logger.Debug("segment relayout", "index", i, "vaddr", p.Vaddr, "size", p.Memsz, "offset", p.Offset)
 	}
 
 	// Update PHDR offsets to match memory layout (Offset = Vaddr - minVaddr).
@@ -1125,7 +1132,7 @@ func (r *ElfRebuilder) rebuildFileLayout() error {
 		r.logger.Debug("segment relayout", "index", i, "vaddr", r.Phdrs[i].Vaddr, "new_offset", r.Phdrs[i].Offset)
 	}
 
-	return nil
+	return totalSize, nil
 }
 
 func (r *ElfRebuilder) patchResidualBasePointers() error {
@@ -1179,17 +1186,7 @@ func (r *ElfRebuilder) patchResidualBasePointers() error {
 }
 
 func (r *ElfRebuilder) isMeaningfulRebasedPointer(v uint64) (bool, *Elf64_Sym) {
-	// 1. Inside a PT_LOAD is the strongest signal.
-	for _, phdr := range r.Phdrs {
-		if phdr.Type != PT_LOAD {
-			continue
-		}
-		if v >= phdr.Vaddr && v < phdr.Vaddr+phdr.Memsz {
-			return true, nil
-		}
-	}
-
-	// 2. Exact symbol / inside symbol is also a good signal.
+	// 1. Exact symbol / inside symbol is the most specific signal.
 	for i, sym := range r.Symbols {
 		if sym.Value == 0 {
 			continue
@@ -1199,23 +1196,12 @@ func (r *ElfRebuilder) isMeaningfulRebasedPointer(v uint64) (bool, *Elf64_Sym) {
 		}
 	}
 
-	// 3. Known metadata ranges.
-	ranges := [][2]uint64{
-		{r.strtabVaddr, r.strtabVaddr + r.strtabSize},
-		{r.symtabVaddr, r.symtabVaddr + r.symCount*sizeofSym},
-		{r.relVaddr, r.relVaddr + r.relSize},
-		{r.relaVaddr, r.relaVaddr + r.relaSize},
-		{r.jmprelVaddr, r.jmprelVaddr + r.jmprelSize},
-		{r.dynamicVaddr, r.dynamicVaddr + uint64(len(r.Dyns))*sizeofDyn},
-		{r.initArrayVaddr, r.initArrayVaddr + r.initArraySize},
-		{r.finiArrayVaddr, r.finiArrayVaddr + r.finiArraySize},
-		{r.preinitArrayVaddr, r.preinitArrayVaddr + r.preinitArraySize},
-		{r.gotVaddr, r.gotVaddr + r.gotSize},
-		{r.pltGotVaddr, r.pltGotVaddr + r.pltGotSize},
-		{r.ehFrameHdrVaddr, r.ehFrameHdrVaddr + r.ehFrameHdrSize},
-	}
-	for _, rr := range ranges {
-		if rr[0] != 0 && v >= rr[0] && v < rr[1] {
+	// 2. Inside a PT_LOAD is a strong signal even without a symbol name.
+	for _, phdr := range r.Phdrs {
+		if phdr.Type != PT_LOAD {
+			continue
+		}
+		if v >= phdr.Vaddr && v < phdr.Vaddr+phdr.Memsz {
 			return true, nil
 		}
 	}
